@@ -39,17 +39,21 @@ The validator exits with:
 
 ## Grid validation modes
 
-CapTOP supports two grid modes:
+CapTOP supports three grid modes:
 
-- `strict` (default): every accepted element must be a true cube with equal
-  edge lengths, and all cubes must lie on one uniform cubic lattice.
+- `strict-cube` (default, legacy alias `strict`): every accepted element must be
+  an exact equal-edge cube and all cubes must lie on one uniform cubic lattice.
+- `approximate-cube`: elements must be axis-aligned and nearly cubic according
+  to `--cube-rel-tol`, while grid mapping uses snapped rectilinear coordinate
+  axes.
 - `rectilinear`: accepted elements may be axis-aligned rectangular voxels on
   rectilinear coordinate axes, but each element must still occupy one interval
   along each axis.
 
-Use `strict` when your data should be a conventional equal-spacing voxel/cube
-model. Use `rectilinear` for axis-aligned meshes whose spacing can vary by
-coordinate interval.
+Use `strict-cube` for synthetic or debugging meshes that should be a conventional
+equal-spacing voxel/cube model. Use `approximate-cube` for GiD/octree outputs
+with small coordinate-rounding artifacts. Use `rectilinear` for topology-first
+analysis of axis-aligned meshes whose spacing can vary by coordinate interval.
 
 ## Supported input format
 
@@ -154,7 +158,13 @@ Validate a GiD mesh with the default strict cubic lattice checks:
 Validate with explicit strict mode:
 
 ```bash
-./captop validate mesh.msh --grid strict
+./captop validate mesh.msh --grid strict-cube
+```
+
+Validate approximately cubic cells using a 2% relative spread tolerance:
+
+```bash
+./captop validate mesh.msh --grid approximate-cube --cube-rel-tol 0.02
 ```
 
 Validate using rectilinear axis-aligned cells:
@@ -163,7 +173,7 @@ Validate using rectilinear axis-aligned cells:
 ./captop validate mesh.msh --grid rectilinear
 ```
 
-Adjust floating-point tolerance:
+Adjust coordinate/snapping tolerance:
 
 ```bash
 ./captop validate mesh.msh --tol 1e-8
@@ -184,7 +194,7 @@ Limit the number of printed validation errors:
 Options can be combined:
 
 ```bash
-./captop validate mesh.msh --grid rectilinear --tol 1e-9 --ignore-non-hexa --max-errors 50
+./captop validate mesh.msh --grid approximate-cube --tol 1e-9 --cube-rel-tol 0.01 --ignore-non-hexa --max-errors 50
 ```
 
 ## Example validation report
@@ -195,11 +205,11 @@ A valid mesh prints a report similar to:
 ============================================================
 CAPTOP validation report
 ============================================================
-Software version      : 0.1.0-stage3
+Software version      : 0.1.1-stage3
 Input file            : mesh.msh
-Grid mode             : strict
-Tolerance             : 1e-08
-Status                : VALID
+Grid mode             : strict-cube
+Coordinate tolerance  : 1e-08
+Status under selected mode: VALID
 
 GiD mesh structure
   Mesh blocks         : 1
@@ -223,7 +233,7 @@ Cubical grid
 Materials/layers
   1 : 1 elements
 
-Ready for Stage 4 bitmap conversion: yes
+Ready for Stage 4 bitmap conversion under selected mode: yes
 ============================================================
 ```
 
@@ -260,14 +270,16 @@ g++ -std=c++17 -O2 -Wall -Wextra -pedantic captop.cpp -o captop
 The current repository is intentionally compact:
 
 - `captop.cpp` contains the command-line interface, GiD parser, geometry checks,
-  grid mapping, and report generation.
+  grid mapping, diagnostics, and report generation.
+- `tests/run_stage3_validation_tests.sh` exercises exact-cube, approximate-cube,
+  rectilinear, duplicate-cell, non-axis-aligned, and missing-node cases.
 - `README.md` documents how to build and run the tool.
 - `LICENSE` contains the MIT license.
 
 The version output notes that GUDHI integration is not enabled in the current
-stage. The final report includes `Ready for Stage 4 bitmap conversion` to show
-whether the parsed cells passed the compatibility checks expected before a later
-bitmap/topology-analysis stage.
+stage. The final report includes `Ready for Stage 4 bitmap conversion under
+selected mode` to show whether the parsed cells passed the compatibility checks
+expected before a later bitmap/topology-analysis stage.
 
 ## License
 
