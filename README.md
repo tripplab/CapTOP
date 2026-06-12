@@ -1,5 +1,7 @@
 # CapTOP
 
+by trippm@tripplab.com on june 2026
+
 CapTOP is a small C++ command-line validator for cubical meshes. Its current
 implementation reads GiD ASCII `.msh` files, extracts supported 3D 8-node
 hexahedral elements, and checks whether those elements can be interpreted as a
@@ -77,11 +79,9 @@ an element record inside an unsupported block is a parse error. Pass
 ## Clone the repository
 
 ```bash
-git clone <repository-url> CapTOP
+git clone https://github.com/tripplab/CapTOP.git
 cd CapTOP
 ```
-
-Replace `<repository-url>` with the actual Git remote URL for this project.
 
 ## Build directly with a system compiler
 
@@ -111,7 +111,7 @@ micromamba activate captop
 Then clone and build inside that environment:
 
 ```bash
-git clone <repository-url> CapTOP
+git clone https://github.com/tripplab/CapTOP.git
 cd CapTOP
 g++ -std=c++17 -O2 -Wall -Wextra -pedantic captop.cpp -o captop
 ./captop --version
