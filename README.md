@@ -479,3 +479,28 @@ tests/run_stage5_tests.sh
 The synthetic cases include a single cube, solid `2 x 2 x 2` block, two
 separated cubes, asymmetric `3 x 2 x 1` block, one-voxel-thick tunnel ring,
 closed hollow shell, and rectilinear unequal-spacing block.
+
+## Stage 5 topology sources
+
+CAPTOP Stage 5 records explicit provenance for every reported topology value so
+fallback diagnostics are not confused with GUDHI-authenticated Betti numbers.
+
+With GUDHI enabled (`-DCAPTOP_WITH_GUDHI=ON`), the headline `H0`, `H1`, `H2`,
+and `H3` values are computed from GUDHI persistent Betti numbers at filtration
+threshold 0. The union-find, complement flood-fill, and cubical-cell Euler
+calculations remain available as independent cross-checks.
+
+Without GUDHI (`-DCAPTOP_WITH_GUDHI=OFF`), `captop betti` can still produce
+fallback diagnostics:
+
+- `H0` from union-find face adjacency.
+- `H2` from complement flood-fill.
+- `chi` from cubical cell counts.
+- `H1` inferred from `H0 + H2 - chi`.
+- `H3` assumed zero for the finite voxel-subset fallback path.
+
+Fallback results are useful for diagnostics and sanity checks, but they are not a
+substitute for the required GUDHI-backed Stage 5 deliverable. Reports generated
+without GUDHI must not be described as GUDHI Betti results. Use
+`captop betti <input.msh> --require-gudhi` to fail rather than accept
+fallback-only analysis when authoritative GUDHI topology is required.
