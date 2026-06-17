@@ -2,19 +2,21 @@
 
 by trippm@tripplab.com on june 2026
 
-CapTOP is a small C++ command-line validator for cubical meshes. Its current
+CapTOP is a small C++ command-line tool for cubical meshes. Its current
 implementation reads GiD ASCII `.msh` files, extracts supported 3D 8-node
-hexahedral elements, and checks whether those elements can be interpreted as a
-bitmap-style cubical complex for downstream topology analysis.
+hexahedral elements, validates that those elements can be interpreted as a
+bitmap-style cubical complex, and converts valid meshes into dense indexed
+cubical bitmap files for downstream topology analysis.
 
 The executable name used throughout this README is `captop`.
 
 ## What CapTOP does
 
-CapTOP currently provides one operational command:
+CapTOP currently provides two operational commands:
 
 ```bash
 captop validate <input.msh> [options]
+captop convert <input.msh> [options]
 ```
 
 During validation, CapTOP:
@@ -36,6 +38,13 @@ The validator exits with:
 - `0` when the mesh is valid.
 - `1` for command-line, input, or parse errors.
 - `2` when parsing succeeds but validation fails.
+
+The converter reuses validation and exits with:
+
+- `0` when conversion succeeds.
+- `1` for command-line, input, parse, or I/O setup errors.
+- `2` when validation fails.
+- `3` when validation succeeds but bitmap conversion fails.
 
 ## Grid validation modes
 
@@ -197,6 +206,62 @@ Options can be combined:
 ./captop validate mesh.msh --grid approximate-cube --tol 1e-9 --cube-rel-tol 0.01 --ignore-non-hexa --max-errors 50
 ```
 
+## Bitmap conversion
+
+Stage 4 adds dense GiD-to-bitmap conversion without computing Betti numbers,
+persistent homology, barcodes, or any GUDHI-dependent topology. Conversion first
+validates the mesh; invalid meshes are never converted.
+
+The dense array order is documented in the metadata and is used by every raw
+file:
+
+```text
+linear_index(i,j,k) = i + nx * (j + ny * k)
+```
+
+A missing cell inside the validated bounding box is represented explicitly with
+`occupied = 0`, `cube_value = +inf`, `material = -1`, and `element_id = -1`.
+
+Basic occupancy conversion:
+
+```bash
+./captop convert mesh.msh --grid strict --filtration occupancy --out out_occ
+```
+
+Material-valued conversion and single-material extraction:
+
+```bash
+./captop convert mesh.msh --filtration material --out out_material
+./captop convert mesh.msh --filtration material --selected-material 3 --out out_material3
+```
+
+Element scalar CSV conversion and binary thresholding:
+
+```bash
+./captop convert mesh.msh --filtration scalar-file --scalar-file values.csv --out out_scalar
+./captop convert mesh.msh --filtration binary-threshold --scalar-file values.csv --threshold 0.5 --threshold-op ge --out out_threshold
+```
+
+The scalar CSV must have a header with `element_id` and `value` columns. Every
+occupied element must have exactly one finite scalar value; duplicate and missing
+entries are conversion errors.
+
+The converter writes:
+
+```text
+outdir/
+  captop_grid_metadata.json
+  captop_cube_values_f64.raw
+  captop_occupied_u8.raw
+  captop_material_i64.raw
+  captop_element_id_i64.raw
+  captop_conversion_report.txt
+```
+
+Existing output files are protected by default. Use `--overwrite` to replace
+them. Dense allocation is limited by `--max-memory-gb` and can be overridden with
+`--force`.
+
 ## Example validation report
 
 A valid mesh prints a report similar to:
@@ -205,7 +270,7 @@ A valid mesh prints a report similar to:
 ============================================================
 CAPTOP validation report
 ============================================================
-Software version      : 0.1.1-stage3
+Software version      : 0.1.0-stage4
 Input file            : mesh.msh
 Grid mode             : strict-cube
 Coordinate tolerance  : 1e-08
@@ -258,11 +323,12 @@ elements
 end elements
 ```
 
-Build and validate it:
+Build, validate, and convert it:
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -pedantic captop.cpp -o captop
 ./captop validate one_cube.msh
+./captop convert one_cube.msh --filtration occupancy --out one_cube_out
 ```
 
 ## Development notes
@@ -270,16 +336,18 @@ g++ -std=c++17 -O2 -Wall -Wextra -pedantic captop.cpp -o captop
 The current repository is intentionally compact:
 
 - `captop.cpp` contains the command-line interface, GiD parser, geometry checks,
-  grid mapping, diagnostics, and report generation.
+  grid mapping, dense bitmap conversion, diagnostics, and report generation.
 - `tests/run_stage3_validation_tests.sh` exercises exact-cube, approximate-cube,
   rectilinear, duplicate-cell, non-axis-aligned, and missing-node cases.
+- `tests/run_stage4_tests.sh` builds CapTOP, creates synthetic GiD meshes, runs
+  conversion modes, and checks metadata plus raw arrays with `tests/check_raw_arrays.py`.
 - `README.md` documents how to build and run the tool.
 - `LICENSE` contains the MIT license.
 
 The version output notes that GUDHI integration is not enabled in the current
-stage. The final report includes `Ready for Stage 4 bitmap conversion under
-selected mode` to show whether the parsed cells passed the compatibility checks
-expected before a later bitmap/topology-analysis stage.
+stage. The validation report includes `Ready for Stage 4 bitmap conversion under
+selected mode`; the conversion report includes `Ready for Stage 5 topology
+computation: yes` after the bitmap files have been written.
 
 ## License
 

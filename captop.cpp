@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <exception>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -28,13 +30,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace captop {
 
-static const char* CAPTOP_VERSION = "0.1.1-stage3";
+static const char* CAPTOP_VERSION = "0.1.0-stage4";
 
 enum class GridMode {
     StrictCube,
@@ -152,6 +155,16 @@ struct RectilinearAxisStats {
     Vec3 median_interval;
 };
 
+struct IndexedCell {
+    long long i = 0;
+    long long j = 0;
+    long long k = 0;
+    long long original_element_id = 0;
+    bool has_material = false;
+    long long material = 0;
+    std::size_t line_number = 0;
+};
+
 struct ValidationResult {
     bool valid = false;
 
@@ -184,6 +197,10 @@ struct ValidationResult {
     bool topology_compatible = false;
 
     std::map<long long, std::size_t> material_counts;
+    std::vector<IndexedCell> indexed_cells;
+    std::vector<double> x_axis;
+    std::vector<double> y_axis;
+    std::vector<double> z_axis;
 };
 
 struct ParseError : public std::runtime_error {
@@ -1067,7 +1084,8 @@ static bool map_rectilinear_cells(
     const std::vector<double>& z_axis,
     const ValidateOptions& opts,
     ValidationResult& result,
-    std::unordered_set<CellIndex, CellIndexHash, CellIndexEqual>& occupied
+    std::unordered_set<CellIndex, CellIndexHash, CellIndexEqual>& occupied,
+    std::vector<IndexedCell>* indexed_cells = nullptr
 ) {
     bool ok_all = true;
     occupied.clear();
@@ -1122,6 +1140,9 @@ static bool map_rectilinear_cells(
         }
 
         occupied.insert(idx);
+        if (indexed_cells != nullptr) {
+            indexed_cells->push_back(IndexedCell{i0, j0, k0, c.element_id, c.has_material, c.material, c.line_number});
+        }
     }
 
     return ok_all;
@@ -1330,6 +1351,7 @@ static ValidationResult validate_mesh(const Mesh& mesh, const ValidateOptions& o
             }
 
             occupied.insert(idx);
+            result.indexed_cells.push_back(IndexedCell{i0, j0, k0, c.element_id, c.has_material, c.material, c.line_number});
 
             max_i = std::max(max_i, i1);
             max_j = std::max(max_j, j1);
@@ -1365,6 +1387,10 @@ static ValidationResult validate_mesh(const Mesh& mesh, const ValidateOptions& o
             }
         }
 
+        result.x_axis = x_axis;
+        result.y_axis = y_axis;
+        result.z_axis = z_axis;
+
         result.origin = Vec3{x_axis.front(), y_axis.front(), z_axis.front()};
         result.spacing = Vec3{
             x_axis.size() > 1U ? x_axis[1] - x_axis[0] : 0.0,
@@ -1376,7 +1402,7 @@ static ValidationResult validate_mesh(const Mesh& mesh, const ValidateOptions& o
         result.ny = static_cast<long long>(y_axis.size()) - 1;
         result.nz = static_cast<long long>(z_axis.size()) - 1;
 
-        map_rectilinear_cells(cells, x_axis, y_axis, z_axis, opts, result, occupied);
+        map_rectilinear_cells(cells, x_axis, y_axis, z_axis, opts, result, occupied, &result.indexed_cells);
     }
 
     if (!result.errors.empty()) {
@@ -1401,7 +1427,7 @@ static ValidationResult validate_mesh(const Mesh& mesh, const ValidateOptions& o
 static std::string grid_mode_name(GridMode mode) {
     switch (mode) {
         case GridMode::StrictCube:
-            return "strict-cube";
+            return "strict";
         case GridMode::ApproximateCube:
             return "approximate-cube";
         case GridMode::Rectilinear:
@@ -1413,16 +1439,18 @@ static std::string grid_mode_name(GridMode mode) {
 static void print_version() {
     std::cout << "captop " << CAPTOP_VERSION << "\n";
     std::cout << "C++ standard target: C++17\n";
-    std::cout << "GUDHI integration: not enabled in stages 1-3\n";
+    std::cout << "GUDHI integration: not enabled in stage 4\n";
 }
 
 static void print_usage(std::ostream& os) {
     os << "CAPTOP - Cubical Analysis Pipeline for Topology\n\n";
     os << "Usage:\n";
     os << "  captop --version\n";
-    os << "  captop validate <input.msh> [options]\n\n";
+    os << "  captop validate <input.msh> [options]\n";
+    os << "  captop convert <input.msh> [options]\n\n";
     os << "Commands:\n";
-    os << "  validate                 Parse GiD ASCII mesh and validate cubic-grid compatibility\n\n";
+    os << "  validate                 Parse GiD ASCII mesh and validate cubic-grid compatibility\n";
+    os << "  convert                  Convert validated mesh to dense indexed cubical bitmap files\n\n";
     os << "Options for validate:\n";
     os << "  --grid strict-cube       Exact equal-edge cubes on a uniform lattice [default]\n";
     os << "  --grid approximate-cube  Axis-aligned cells nearly cubic within --cube-rel-tol\n";
@@ -1746,6 +1774,128 @@ static int run_validate(int argc, char** argv) {
     }
 }
 
+
+struct GridCell {
+    bool occupied = false;
+    double cube_value = std::numeric_limits<double>::infinity();
+    long long material = 0;
+    bool has_material = false;
+    long long original_element_id = -1;
+};
+
+struct ConvertOptions {
+    std::string out_dir = "captop_out";
+    std::string filtration = "occupancy";
+    std::string scalar_file;
+    bool has_threshold = false;
+    double threshold = 0.0;
+    std::string threshold_op = "ge";
+    bool has_selected_material = false;
+    long long selected_material = 0;
+    bool force = false;
+    bool overwrite = false;
+    double max_memory_gb = 4.0;
+};
+
+struct ConvertCounts { std::size_t occupied=0, missing=0, finite=0, selected=0; };
+
+static std::size_t linear_index(long long i,long long j,long long k,long long nx,long long ny){
+    return static_cast<std::size_t>(i + nx * (j + ny * k));
+}
+
+static std::string json_escape(const std::string& v){
+    std::ostringstream o; for(char c: v){ if(c=='"'||c=='\\') o<<'\\'<<c; else if(c=='\n') o<<"\\n"; else o<<c; } return o.str();
+}
+static void write_axis_json(std::ostream& out,const std::vector<double>& a){
+    out << "["; for(size_t i=0;i<a.size();++i){ if(i) out << ", "; out << std::setprecision(17) << a[i]; } out << "]";
+}
+
+static std::unordered_map<long long,double> read_scalar_file(const std::string& path){
+    std::ifstream in(path.c_str()); if(!in) throw std::runtime_error("cannot open scalar file '"+path+"'");
+    std::string line; if(!std::getline(in,line)) throw std::runtime_error("scalar file is empty");
+    auto split=[](const std::string& x){ std::vector<std::string> r; std::string cur; std::istringstream ss(x); while(std::getline(ss,cur,',')) r.push_back(trim(cur)); return r; };
+    auto h=split(line); int eid=-1,val=-1; for(size_t i=0;i<h.size();++i){ if(h[i]=="element_id") eid=i; if(h[i]=="value") val=i; }
+    if(eid<0||val<0) throw std::runtime_error("scalar file header must contain element_id and value columns");
+    if(h.size()>2) std::cerr << "warning: extra scalar CSV columns are ignored\n";
+    std::unordered_map<long long,double> m; size_t ln=1;
+    while(std::getline(in,line)){ ++ln; if(trim(line).empty()) continue; auto f=split(line); if(f.size()<=static_cast<size_t>(std::max(eid,val))) throw std::runtime_error("scalar file line "+std::to_string(ln)+" has missing values");
+        long long id; double v; if(!parse_long_long(f[eid],id)) throw std::runtime_error("scalar file line "+std::to_string(ln)+" has unparsable element_id");
+        if(!parse_double(f[val],v)) throw std::runtime_error("scalar file line "+std::to_string(ln)+" has nonfinite or unparsable value");
+        if (m.count(id)) {
+            throw std::runtime_error("duplicate scalar value for element " + std::to_string(id));
+        }
+        m[id] = v;
+    }
+    return m;
+}
+
+static bool threshold_pass(double v,double t,const std::string& op,double tol){
+    if (op == "lt") { return v < t; }
+    if (op == "le") { return v <= t; }
+    if (op == "gt") { return v > t; }
+    if (op == "ge") { return v >= t; }
+    if (op == "eq") { return nearly_equal(v, t, tol); }
+    if (op == "ne") { return !nearly_equal(v, t, tol); }
+    throw std::runtime_error("unknown threshold operator '" + op + "'");
+}
+
+template<class T> static void write_raw(const std::filesystem::path& path,const std::vector<T>& v){
+    std::ofstream out(path, std::ios::binary); if(!out) throw std::runtime_error("cannot open output file '"+path.string()+"'");
+    out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()*sizeof(T))); if(!out) throw std::runtime_error("could not write complete raw file '"+path.string()+"'");
+}
+
+static std::string conversion_report(const std::string& input,const std::string& outdir,const ValidateOptions& vopts,const ConvertOptions& copts,const ValidationResult& vr,const ConvertCounts& c,size_t bytes){
+    std::ostringstream r; r<<"============================================================\nCAPTOP conversion report\n============================================================\n";
+    r<<"Software version      : "<<CAPTOP_VERSION<<"\nInput file            : "<<input<<"\nOutput directory      : "<<outdir<<"\nGrid mode             : "<<grid_mode_name(vopts.grid_mode)<<"\nTolerance             : "<<std::setprecision(12)<<vopts.tol<<"\nFiltration policy     : "<<copts.filtration<<"\nStatus                : VALID AND CONVERTED\n\nGrid\n  Dimensions          : "<<vr.nx<<" x "<<vr.ny<<" x "<<vr.nz<<"\n  Total cells         : "<<(c.occupied+c.missing)<<"\n  Occupied cells      : "<<c.occupied<<"\n  Missing cells       : "<<c.missing<<"\n  Finite-value cells  : "<<c.finite<<"\n  Selected cells      : "<<c.selected<<"\n  Dense memory estimate: "<<bytes<<" bytes\n\nFiles written\n  Metadata            : "<<outdir<<"/captop_grid_metadata.json\n  Cube values         : "<<outdir<<"/captop_cube_values_f64.raw\n  Occupancy           : "<<outdir<<"/captop_occupied_u8.raw\n  Materials           : "<<outdir<<"/captop_material_i64.raw\n  Element ids         : "<<outdir<<"/captop_element_id_i64.raw\n  Report              : "<<outdir<<"/captop_conversion_report.txt\n\nReady for Stage 5 topology computation: yes\n============================================================\n"; return r.str();
+}
+
+static int run_convert(int argc,char** argv){
+    if(argc<3){ print_usage(std::cerr); return 1; }
+    std::string input=argv[2]; ParseOptions popts; ValidateOptions vopts; ConvertOptions copts;
+    for(int i=3;i<argc;++i){ std::string a=argv[i];
+        auto need=[&](const std::string& n){ if(i+1>=argc) throw std::runtime_error(n+" requires a value"); return std::string(argv[++i]); };
+        try{
+        if(a=="--grid"){ auto v=to_lower(need(a)); if(v=="strict"||v=="strict-cube") vopts.grid_mode=GridMode::StrictCube; else if(v=="rectilinear") vopts.grid_mode=GridMode::Rectilinear; else if(v=="approximate-cube") vopts.grid_mode=GridMode::ApproximateCube; else throw std::runtime_error("unsupported grid mode '"+v+"'"); }
+        else if(a=="--tol"){ if(!parse_double(need(a),vopts.tol)||vopts.tol<=0) throw std::runtime_error("invalid --tol"); }
+        else if(a=="--ignore-non-hexa") popts.ignore_non_hexa=true;
+        else if(a=="--max-errors"){ long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vopts.max_errors=n; }
+        else if(a=="--out") copts.out_dir=need(a);
+        else if(a=="--filtration") copts.filtration=need(a);
+        else if(a=="--scalar-file") copts.scalar_file=need(a);
+        else if(a=="--threshold"){ if(!parse_double(need(a),copts.threshold)) throw std::runtime_error("invalid --threshold"); copts.has_threshold=true; }
+        else if(a=="--threshold-op") copts.threshold_op=need(a);
+        else if(a=="--selected-material"){ long long m; if(!parse_long_long(need(a),m)) throw std::runtime_error("invalid --selected-material"); copts.has_selected_material=true; copts.selected_material=m; }
+        else if(a=="--missing-value"){ if(need(a)!="inf") throw std::runtime_error("--missing-value only accepts inf in Stage 4"); }
+        else if(a=="--force") copts.force=true; else if(a=="--overwrite") copts.overwrite=true;
+        else if(a=="--max-memory-gb"){ if(!parse_double(need(a),copts.max_memory_gb)||copts.max_memory_gb<=0) throw std::runtime_error("invalid --max-memory-gb"); }
+        else throw std::runtime_error("unknown option '"+a+"'");
+        } catch(const std::runtime_error& e){ std::cerr<<"error: "<<e.what()<<"\n"; return 1; }
+    }
+    try{
+        if(copts.has_selected_material && copts.filtration!="material") throw std::runtime_error("--selected-material is only compatible with --filtration material");
+        if((copts.filtration=="scalar-file"||copts.filtration=="binary-threshold") && copts.scalar_file.empty()) throw std::runtime_error("--filtration "+copts.filtration+" requires --scalar-file");
+        if(copts.filtration=="binary-threshold" && !copts.has_threshold) throw std::runtime_error("--filtration binary-threshold requires --threshold");
+        if(copts.filtration!="occupancy"&&copts.filtration!="material"&&copts.filtration!="scalar-file"&&copts.filtration!="binary-threshold") throw std::runtime_error("unknown filtration policy '"+copts.filtration+"'");
+        Mesh mesh=parse_gid_mesh(input,popts); ValidationResult vr=validate_mesh(mesh,vopts); if(!vr.valid){ print_validation_report(input,vopts,vr); return 2; }
+        if(vr.nx<=0||vr.ny<=0||vr.nz<=0) throw std::runtime_error("grid dimensions must be positive");
+        size_t sx=vr.nx, sy=vr.ny, sz=vr.nz; if(sx>std::numeric_limits<size_t>::max()/sy || sx*sy>std::numeric_limits<size_t>::max()/sz) throw std::runtime_error("integer overflow in nx * ny * nz");
+        size_t total=sx*sy*sz, bytes=total*sizeof(GridCell); double limit=copts.max_memory_gb*1024.0*1024.0*1024.0; if(bytes>limit&&!copts.force) throw std::runtime_error("dense memory estimate exceeds --max-memory-gb; use --force to override");
+        std::vector<GridCell> cells(total); std::unordered_map<long long,double> scalars; if(copts.filtration=="scalar-file"||copts.filtration=="binary-threshold") scalars=read_scalar_file(copts.scalar_file);
+        for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); auto& g=cells.at(idx); if(g.occupied) throw std::runtime_error("duplicate occupied grid cell "+cell_key_string(CellIndex{ic.i,ic.j,ic.k})); g.occupied=true; g.original_element_id=ic.original_element_id; g.has_material=ic.has_material; g.material=ic.has_material?ic.material:0; double val=0.0;
+            if(copts.filtration=="occupancy") val=0.0; else if(copts.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" has no material/layer id, but --filtration material requires material values for all occupied cells"); val=copts.has_selected_material ? (ic.material==copts.selected_material?0.0:std::numeric_limits<double>::infinity()) : static_cast<double>(ic.material); }
+            else { auto it=scalars.find(ic.original_element_id); if(it==scalars.end()) throw std::runtime_error("missing scalar value for element "+std::to_string(ic.original_element_id)); val=(copts.filtration=="scalar-file")?it->second:(threshold_pass(it->second,copts.threshold,copts.threshold_op,vopts.tol)?0.0:std::numeric_limits<double>::infinity()); }
+            g.cube_value=val; }
+        ConvertCounts cnt; std::vector<double> values(total); std::vector<uint8_t> occ(total); std::vector<int64_t> mat(total), eid(total);
+        for(size_t i=0;i<total;++i){ const auto& g=cells[i]; values[i]=g.cube_value; occ[i]=g.occupied?1:0; mat[i]=g.occupied?(g.has_material?g.material:0):-1; eid[i]=g.occupied?g.original_element_id:-1; if(g.occupied) cnt.occupied++; else cnt.missing++; if(std::isfinite(g.cube_value)) cnt.finite++; }
+        cnt.selected=cnt.finite; if(cnt.occupied!=mesh.hexes.size()) throw std::runtime_error("occupied_cubes does not match parsed hexahedra");
+        std::filesystem::path outdir(copts.out_dir); std::filesystem::create_directories(outdir); if(!std::filesystem::is_directory(outdir)) throw std::runtime_error("output directory cannot be created");
+        std::vector<std::string> names={"captop_grid_metadata.json","captop_cube_values_f64.raw","captop_occupied_u8.raw","captop_material_i64.raw","captop_element_id_i64.raw","captop_conversion_report.txt"}; for(auto& n:names) if(!copts.overwrite && std::filesystem::exists(outdir/n)) throw std::runtime_error("output file already exists: "+(outdir/n).string());
+        write_raw(outdir/"captop_cube_values_f64.raw",values); write_raw(outdir/"captop_occupied_u8.raw",occ); write_raw(outdir/"captop_material_i64.raw",mat); write_raw(outdir/"captop_element_id_i64.raw",eid);
+        { std::ofstream js(outdir/"captop_grid_metadata.json"); js<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vopts.grid_mode)<<"\", \"tolerance\": "<<vopts.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_cells\": "<<total<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<", "<<vr.spacing.y<<", "<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\", \"axis_order\": [\"x\", \"y\", \"z\"]}"; if(vopts.grid_mode==GridMode::Rectilinear){ js<<",\n  \"axes\": {\"x\": "; write_axis_json(js,vr.x_axis); js<<", \"y\": "; write_axis_json(js,vr.y_axis); js<<", \"z\": "; write_axis_json(js,vr.z_axis); js<<"}";} js<<",\n  \"counts\": {\"nodes\": "<<vr.n_nodes<<", \"hexahedra\": "<<vr.n_hexes<<", \"occupied_cubes\": "<<cnt.occupied<<", \"missing_cubes\": "<<cnt.missing<<", \"finite_value_cubes\": "<<cnt.finite<<", \"selected_cubes\": "<<cnt.selected<<"},\n  \"filtration\": {\"policy\": \""<<copts.filtration<<"\", \"missing_value\": \"+inf\", \"scalar_file\": "; if(copts.scalar_file.empty()) js<<"null"; else js<<"\""<<json_escape(copts.scalar_file)<<"\""; js<<", \"threshold\": "; if(copts.has_threshold) js<<copts.threshold; else js<<"null"; js<<", \"threshold_op\": "; if(copts.filtration=="binary-threshold") js<<"\""<<copts.threshold_op<<"\""; else js<<"null"; js<<", \"selected_material\": "; if(copts.has_selected_material) js<<copts.selected_material; else js<<"null"; js<<"},\n  \"raw_files\": {\"cube_values_f64\": {\"path\": \"captop_cube_values_f64.raw\", \"type\": \"float64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"occupied_u8\": {\"path\": \"captop_occupied_u8.raw\", \"type\": \"uint8\", \"count\": "<<total<<"}, \"material_i64\": {\"path\": \"captop_material_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"element_id_i64\": {\"path\": \"captop_element_id_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}}\n}\n"; if(!js) throw std::runtime_error("cannot write metadata"); }
+        std::string rep=conversion_report(input,copts.out_dir,vopts,copts,vr,cnt,bytes); { std::ofstream rr(outdir/"captop_conversion_report.txt"); rr<<rep; if(!rr) throw std::runtime_error("cannot write conversion report"); } std::cout<<rep; return 0;
+    } catch(const ParseError& e){ std::cerr<<"parse error: "<<e.what()<<"\n"; return 1; } catch(const std::exception& e){ std::cerr<<"conversion error: "<<e.what()<<"\n"; return 3; }
+}
+
 } // namespace captop
 
 int main(int argc, char** argv) {
@@ -1768,6 +1918,10 @@ int main(int argc, char** argv) {
 
     if (command == "validate") {
         return captop::run_validate(argc, argv);
+    }
+
+    if (command == "convert") {
+        return captop::run_convert(argc, argv);
     }
 
     std::cerr << "error: unknown command '" << command << "'\n";
