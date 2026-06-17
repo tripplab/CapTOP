@@ -395,24 +395,35 @@ stable index order
 linear_index(i,j,k) = i + nx * (j + ny * k)
 ```
 
-and computes topology for the binary occupied voxel domain. Occupied voxels are
-connected by shared faces only, i.e. 6-neighbor voxel adjacency. Missing voxels
-inside the bounding box are assigned `+inf` in the cubical filtration, while
-occupied top-dimensional cubes are assigned `0.0`. When CAPTOP is built with
-GUDHI support, Betti numbers are queried at threshold `from = 0.0`, `to = 0.0`,
-not from the final all-included rectangular filtration.
+and computes topology for the binary occupied voxel domain. CAPTOP Stage 5
+uses the topology of the closed occupied cubical complex as the primary topology
+convention. Under this convention, occupied voxels whose closed cubes touch by a
+face, edge, or vertex may belong to the same connected component; the primary
+connectivity diagnostic is therefore 26-neighbor closed-cube connectivity.
+CAPTOP also reports 6-neighbor face-adjacency components as a mesh-quality
+diagnostic. This diagnostic may be larger than GUDHI `H0` when separate
+face-connected components touch at edges or vertices. Missing voxels inside the
+bounding box are assigned `+inf` in the cubical filtration, while occupied
+top-dimensional cubes are assigned `0.0`. When CAPTOP is built with GUDHI
+support, Betti numbers are queried at threshold `from = 0.0`, `to = 0.0`, not
+from the final all-included rectangular filtration.
 
 Reported descriptors include:
 
-- `H0` connected components.
+- `H0` connected components under the primary closed-cube topology.
 - `H1` independent tunnels.
 - `H2` enclosed cavities.
 - Euler characteristic `chi = H0 - H1 + H2`.
 - Occupied, missing, and total bounding-box voxel counts.
 - Bounding-box dimensions.
 - Surface voxel count and exposed surface face count.
-- Union-find `H0`, cubical-cell Euler characteristic, GUDHI Euler
-  characteristic, and cross-check status.
+- Closed-cube `H0_closed` (26-neighbor) and face-adjacency `H0_face`
+  (6-neighbor) union-find diagnostics.
+- Contact audit counts for face, edge, and vertex contacts.
+- A deterministic merger audit explaining reductions from `H0_face` to
+  `H0_closed` when edge/vertex contacts merge face components.
+- Cubical-cell Euler characteristic, GUDHI Euler characteristic, and cross-check
+  status.
 - Complement flood-fill `H2` diagnostic.
 
 Example:
@@ -430,6 +441,7 @@ Useful Stage 5 options:
 --max-memory-gb <value>  dense-grid memory limit, default 2.0
 --force                  continue above the memory limit
 --write-diagram          reserve raw interval outputs for debugging
+--write-contact-audit    request contact audit CSV files
 --write-json             request JSON summary output
 --write-csv              request CSV summary output
 --quiet                  suppress the terminal report
@@ -441,6 +453,9 @@ By default, successful Betti runs write:
 captop_betti_summary.json
 captop_betti_summary.csv
 captop_betti_report.txt
+captop_contact_audit_summary.json
+captop_contact_mergers.csv
+captop_contact_contacts.csv
 ```
 
 Exit statuses for `betti` are:
@@ -474,6 +489,7 @@ The Stage 5 test runner builds CAPTOP, generates synthetic GiD meshes, runs
 
 ```bash
 tests/run_stage5_tests.sh
+tests/run_stage5_contact_audit_tests.sh
 ```
 
 The synthetic cases include a single cube, solid `2 x 2 x 2` block, two
@@ -487,16 +503,26 @@ fallback diagnostics are not confused with GUDHI-authenticated Betti numbers.
 
 With GUDHI enabled (`-DCAPTOP_WITH_GUDHI=ON`), the headline `H0`, `H1`, `H2`,
 and `H3` values are computed from GUDHI persistent Betti numbers at filtration
-threshold 0. The union-find, complement flood-fill, and cubical-cell Euler
-calculations remain available as independent cross-checks.
+threshold 0. GUDHI `H0` is expected to match `H0_closed`, the 26-neighbor
+closed-cube union-find count. `H0_face`, the 6-neighbor face-adjacency count, is
+a diagnostic only and is not a fatal cross-check when it differs from GUDHI.
+Complement flood-fill and cubical-cell Euler calculations remain available as
+independent cross-checks.
+
+If `H0_face` differs from `H0_closed`, CAPTOP writes a contact audit showing
+which edge or vertex contacts merge face components under the closed-cube
+topology. `captop_contact_mergers.csv` contains one row for each successful
+face-component merger, while `captop_contact_contacts.csv` contains all
+inter-face-component contact records.
 
 Without GUDHI (`-DCAPTOP_WITH_GUDHI=OFF`), `captop betti` can still produce
 fallback diagnostics:
 
-- `H0` from union-find face adjacency.
+- `H0` from closed-cube 26-neighbor union-find.
+- `H0_face` from 6-neighbor face-adjacency union-find as a diagnostic.
 - `H2` from complement flood-fill.
 - `chi` from cubical cell counts.
-- `H1` inferred from `H0 + H2 - chi`.
+- `H1` inferred from `H0_closed + H2 - chi`.
 - `H3` assumed zero for the finite voxel-subset fallback path.
 
 Fallback results are useful for diagnostics and sanity checks, but they are not a
