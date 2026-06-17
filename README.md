@@ -84,10 +84,12 @@ an element record inside an unsupported block is a parse error. Pass
 ## Requirements
 
 - A C++17 compiler such as `g++` or `clang++`.
-- Standard C++ library headers only; there are no third-party runtime
-  dependencies in the current codebase.
+- `cmake` for the supported Stage 5 build.
+- GUDHI development headers for `captop betti` when building with
+  `CAPTOP_WITH_GUDHI=ON`.
 - Optional: `git` for cloning the repository.
-- Optional: `micromamba` if you want an isolated build environment.
+- Optional: `micromamba` if you want an isolated build environment with all
+  compiler, CMake, and GUDHI dependencies.
 
 ## Clone the repository
 
@@ -113,27 +115,19 @@ Check that the binary runs:
 
 ## Create a micromamba build environment
 
-If your system does not already have a suitable C++ compiler, create an isolated
-Conda-style environment with `micromamba`:
+If your system does not already have a suitable C++ compiler, CMake, and GUDHI
+installation, create an isolated Conda-style environment with `micromamba` from
+the `conda-forge` channel:
 
 ```bash
-micromamba create -n captop -c conda-forge cxx-compiler make git
+micromamba create -n captop -c conda-forge \
+  cxx-compiler \
+  cmake \
+  make \
+  ninja \
+  git \
+  gudhi
 micromamba activate captop
-```
-
-Then clone and build inside that environment:
-
-```bash
-git clone https://github.com/tripplab/CapTOP.git
-cd CapTOP
-g++ -std=c++17 -O2 -Wall -Wextra -pedantic captop.cpp -o captop
-./captop --version
-```
-
-When you are done working on CapTOP, leave the environment with:
-
-```bash
-micromamba deactivate
 ```
 
 If your shell has not yet been initialized for micromamba activation, run the
@@ -142,6 +136,37 @@ shell hook recommended by your micromamba installation first, for example:
 ```bash
 eval "$(micromamba shell hook --shell bash)"
 micromamba activate captop
+```
+
+Then clone and build inside that environment with Stage 5 GUDHI support enabled:
+
+```bash
+git clone https://github.com/tripplab/CapTOP.git
+cd CapTOP
+cmake -S . -B build \
+  -DCAPTOP_WITH_GUDHI=ON \
+  -DGUDHI_INCLUDE_DIR="$CONDA_PREFIX/include"
+cmake --build build
+./build/captop --version
+./build/captop --help
+```
+
+The `gudhi` Conda package installs the required headers under
+`$CONDA_PREFIX/include`, which is why the CMake command above passes that path as
+`GUDHI_INCLUDE_DIR`. If you only need to work on parser, validation, or bitmap
+conversion code and do not need the GUDHI-backed `betti` command, you can build
+without GUDHI instead:
+
+```bash
+cmake -S . -B build-no-gudhi -DCAPTOP_WITH_GUDHI=OFF
+cmake --build build-no-gudhi
+./build-no-gudhi/captop --version
+```
+
+When you are done working on CapTOP, leave the environment with:
+
+```bash
+micromamba deactivate
 ```
 
 ## Usage
@@ -352,3 +377,105 @@ computation: yes` after the bitmap files have been written.
 ## License
 
 CapTOP is distributed under the MIT License. See [LICENSE](LICENSE) for details.
+
+## Stage 5 Betti topology
+
+Stage 5 adds plain occupied-domain topology descriptors for validated cubical GiD
+meshes:
+
+```bash
+captop betti <input.msh> [options]
+```
+
+The `betti` command parses the mesh, runs the same Stage 3 grid validator used
+by `validate`, builds the Stage 4 dense occupancy bitmap in memory with the
+stable index order
+
+```text
+linear_index(i,j,k) = i + nx * (j + ny * k)
+```
+
+and computes topology for the binary occupied voxel domain. Occupied voxels are
+connected by shared faces only, i.e. 6-neighbor voxel adjacency. Missing voxels
+inside the bounding box are assigned `+inf` in the cubical filtration, while
+occupied top-dimensional cubes are assigned `0.0`. When CAPTOP is built with
+GUDHI support, Betti numbers are queried at threshold `from = 0.0`, `to = 0.0`,
+not from the final all-included rectangular filtration.
+
+Reported descriptors include:
+
+- `H0` connected components.
+- `H1` independent tunnels.
+- `H2` enclosed cavities.
+- Euler characteristic `chi = H0 - H1 + H2`.
+- Occupied, missing, and total bounding-box voxel counts.
+- Bounding-box dimensions.
+- Surface voxel count and exposed surface face count.
+- Union-find `H0`, cubical-cell Euler characteristic, GUDHI Euler
+  characteristic, and cross-check status.
+- Complement flood-fill `H2` diagnostic.
+
+Example:
+
+```bash
+captop betti mesh.msh --grid strict --field 2 --out captop_betti_out --overwrite
+```
+
+Useful Stage 5 options:
+
+```text
+--field <prime>          coefficient field, default 2
+--out <directory>        output directory, default captop_betti_out
+--overwrite              allow replacing existing output files
+--max-memory-gb <value>  dense-grid memory limit, default 2.0
+--force                  continue above the memory limit
+--write-diagram          reserve raw interval outputs for debugging
+--write-json             request JSON summary output
+--write-csv              request CSV summary output
+--quiet                  suppress the terminal report
+```
+
+By default, successful Betti runs write:
+
+```text
+captop_betti_summary.json
+captop_betti_summary.csv
+captop_betti_report.txt
+```
+
+Exit statuses for `betti` are:
+
+- `0` success.
+- `1` CLI, parse, build, GUDHI, or I/O error.
+- `2` validation error.
+- `3` conversion/grid construction error.
+- `4` topology cross-check failure.
+
+## CMake build
+
+CAPTOP now includes a CMake build. Stage 5 GUDHI support is requested by
+default:
+
+```bash
+cmake -S . -B build -DCAPTOP_WITH_GUDHI=ON -DGUDHI_INCLUDE_DIR=/path/to/gudhi/include
+cmake --build build
+./build/captop --version
+```
+
+If GUDHI headers are unavailable, configure with `-DCAPTOP_WITH_GUDHI=OFF` for
+validator/converter development builds. In that configuration, `captop betti`
+still runs the independent diagnostics, but the JSON summary marks GUDHI as not
+enabled and the report includes a warning.
+
+## Stage 5 tests
+
+The Stage 5 test runner builds CAPTOP, generates synthetic GiD meshes, runs
+`validate` and `betti`, and checks JSON topology values exactly:
+
+```bash
+tests/run_stage5_tests.sh
+```
+
+The synthetic cases include a single cube, solid `2 x 2 x 2` block, two
+separated cubes, asymmetric `3 x 2 x 1` block, one-voxel-thick tunnel ring,
+closed hollow shell, and rectilinear unequal-spacing block.
