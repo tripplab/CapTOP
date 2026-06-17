@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 #include <exception>
 #include <cstdint>
 #include <filesystem>
@@ -33,11 +34,16 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <queue>
 #include <vector>
+#ifdef CAPTOP_WITH_GUDHI
+#include <gudhi/Bitmap_cubical_complex.h>
+#include <gudhi/Persistent_cohomology.h>
+#endif
 
 namespace captop {
 
-static const char* CAPTOP_VERSION = "0.1.0-stage4";
+static const char* CAPTOP_VERSION = "0.1.0-stage5";
 
 enum class GridMode {
     StrictCube,
@@ -1439,7 +1445,7 @@ static std::string grid_mode_name(GridMode mode) {
 static void print_version() {
     std::cout << "captop " << CAPTOP_VERSION << "\n";
     std::cout << "C++ standard target: C++17\n";
-    std::cout << "GUDHI integration: not enabled in stage 4\n";
+    std::cout << "GUDHI integration: enabled when built with CAPTOP_WITH_GUDHI=ON\n";
 }
 
 static void print_validation_options(std::ostream& os) {
@@ -1477,10 +1483,21 @@ static void print_validate_usage(std::ostream& os) {
 
 static void print_convert_usage(std::ostream& os) {
     os << "Usage:\n";
-    os << "  captop convert <input.msh> [options]\n\n";
+    os << "  captop convert <input.msh> [options]\n";
+    os << "  captop betti <input.msh> [options]\n\n";
     print_validation_options(os);
     os << "\n";
     print_convert_options(os);
+    os << "\nBetti options:\n";
+    os << "  --field <prime>          Coefficient field [default: 2]\n";
+    os << "  --out <dir>              Output directory [default: captop_betti_out]\n";
+    os << "  --overwrite              Replace existing Betti output files\n";
+    os << "  --max-memory-gb <value>  Dense-grid memory limit [default: 2]\n";
+    os << "  --force                  Continue above memory limit\n";
+    os << "  --write-diagram          Write raw persistence intervals for debugging\n";
+    os << "  --write-json             Write JSON summary (included by default)\n";
+    os << "  --write-csv              Write CSV summary (included by default)\n";
+    os << "  --quiet                  Suppress terminal report\n";
     os << "  -h, --help               Show this help message\n";
 }
 
@@ -1489,13 +1506,25 @@ static void print_usage(std::ostream& os) {
     os << "Usage:\n";
     os << "  captop --version\n";
     os << "  captop validate <input.msh> [options]\n";
-    os << "  captop convert <input.msh> [options]\n\n";
+    os << "  captop convert <input.msh> [options]\n";
+    os << "  captop betti <input.msh> [options]\n\n";
     os << "Commands:\n";
     os << "  validate                 Parse GiD ASCII mesh and validate cubic-grid compatibility\n";
-    os << "  convert                  Convert validated mesh to dense indexed cubical bitmap files\n\n";
+    os << "  convert                  Convert validated mesh to dense indexed cubical bitmap files\n";
+    os << "  betti                   Compute Stage 5 occupied-domain Betti descriptors\n\n";
     print_validation_options(os);
     os << "\n";
     print_convert_options(os);
+    os << "\nBetti options:\n";
+    os << "  --field <prime>          Coefficient field [default: 2]\n";
+    os << "  --out <dir>              Output directory [default: captop_betti_out]\n";
+    os << "  --overwrite              Replace existing Betti output files\n";
+    os << "  --max-memory-gb <value>  Dense-grid memory limit [default: 2]\n";
+    os << "  --force                  Continue above memory limit\n";
+    os << "  --write-diagram          Write raw persistence intervals for debugging\n";
+    os << "  --write-json             Write JSON summary (included by default)\n";
+    os << "  --write-csv              Write CSV summary (included by default)\n";
+    os << "  --quiet                  Suppress terminal report\n";
     os << "  -h, --help               Show this help message\n";
 }
 
@@ -1934,6 +1963,40 @@ static int run_convert(int argc,char** argv){
     } catch(const ParseError& e){ std::cerr<<"parse error: "<<e.what()<<"\n"; return 1; } catch(const std::exception& e){ std::cerr<<"conversion error: "<<e.what()<<"\n"; return 3; }
 }
 
+struct BettiOptions { std::string out_dir="captop_betti_out"; bool overwrite=false, force=false, write_diagram=false, write_json=false, write_csv=false, quiet=false; double max_memory_gb=2.0; int field=2; };
+struct BettiResult { bool success=false; int H0=0,H1=0,H2=0,H3=0,H0_union_find=0,H2_complement=-1; long long chi_gudhi=0,chi_cells=0,occupied_voxels=0,missing_voxels=0,total_voxels=0,surface_voxels=0,surface_faces=0,C0=0,C1=0,C2=0,C3=0; double occupied_fraction=0; std::vector<std::string> warnings,errors; };
+static bool is_prime_field(int p){ if(p<2) return false; for(int d=2; d*d<=p; ++d) if(p%d==0) return false; return true; }
+struct DSU{ std::vector<int> p,r; explicit DSU(size_t n):p(n),r(n,0){std::iota(p.begin(),p.end(),0);} int find(int x){return p[x]==x?x:p[x]=find(p[x]);} void unite(int a,int b){a=find(a);b=find(b); if(a==b)return; if(r[a]<r[b])std::swap(a,b); p[b]=a; if(r[a]==r[b])r[a]++;}};
+static BettiResult analyze_betti(const ValidationResult& vr,const BettiOptions& opts){
+    BettiResult br; if(vr.nx<=0||vr.ny<=0||vr.nz<=0) throw std::runtime_error("grid dimensions must be positive");
+    size_t sx=vr.nx,sy=vr.ny,sz=vr.nz; if(sx>SIZE_MAX/sy||sx*sy>SIZE_MAX/sz) throw std::runtime_error("integer overflow in nx * ny * nz"); size_t total=sx*sy*sz; size_t bytes=total*(sizeof(uint8_t)+sizeof(int)); if(bytes>opts.max_memory_gb*1024.0*1024*1024&&!opts.force) throw std::runtime_error("dense memory estimate exceeds --max-memory-gb; use --force to override");
+    br.total_voxels=total; br.occupied_voxels=vr.indexed_cells.size(); br.missing_voxels=br.total_voxels-br.occupied_voxels; br.occupied_fraction=total?double(br.occupied_voxels)/double(total):0;
+    std::vector<uint8_t> occ(total,0); std::vector<int> compact(total,-1); int cid=0; for(auto& ic:vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); if(occ[idx]) throw std::runtime_error("duplicate occupied grid cell during Betti grid construction"); occ[idx]=1; compact[idx]=cid++; }
+    DSU dsu(br.occupied_voxels); auto occupied=[&](long long i,long long j,long long k){return i>=0&&j>=0&&k>=0&&i<vr.nx&&j<vr.ny&&k<vr.nz&&occ[linear_index(i,j,k,vr.nx,vr.ny)];};
+    for(auto& ic:vr.indexed_cells){ size_t a=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); bool surf=false; const int dirs[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}; for(auto& d:dirs){ long long ni=ic.i+d[0],nj=ic.j+d[1],nk=ic.k+d[2]; if(!occupied(ni,nj,nk)){ br.surface_faces++; surf=true; }} if(surf) br.surface_voxels++; const int pd[3][3]={{1,0,0},{0,1,0},{0,0,1}}; for(auto& d:pd){ long long ni=ic.i+d[0],nj=ic.j+d[1],nk=ic.k+d[2]; if(occupied(ni,nj,nk)) dsu.unite(compact[a],compact[linear_index(ni,nj,nk,vr.nx,vr.ny)]); }}
+    std::unordered_set<int> roots; for(int i=0;i<cid;++i) roots.insert(dsu.find(i)); br.H0_union_find=roots.size();
+    std::unordered_set<std::string> V,E,F; for(auto& ic:vr.indexed_cells){ long long i=ic.i,j=ic.j,k=ic.k; for(int dx=0;dx<2;++dx)for(int dy=0;dy<2;++dy)for(int dz=0;dz<2;++dz) V.insert(std::to_string(i+dx)+","+std::to_string(j+dy)+","+std::to_string(k+dz)); for(int dy=0;dy<2;++dy)for(int dz=0;dz<2;++dz) E.insert("x,"+std::to_string(i)+","+std::to_string(j+dy)+","+std::to_string(k+dz)); for(int dx=0;dx<2;++dx)for(int dz=0;dz<2;++dz) E.insert("y,"+std::to_string(i+dx)+","+std::to_string(j)+","+std::to_string(k+dz)); for(int dx=0;dx<2;++dx)for(int dy=0;dy<2;++dy) E.insert("z,"+std::to_string(i+dx)+","+std::to_string(j+dy)+","+std::to_string(k)); for(int dx=0;dx<2;++dx) F.insert("x,"+std::to_string(i+dx)+","+std::to_string(j)+","+std::to_string(k)); for(int dy=0;dy<2;++dy) F.insert("y,"+std::to_string(i)+","+std::to_string(j+dy)+","+std::to_string(k)); for(int dz=0;dz<2;++dz) F.insert("z,"+std::to_string(i)+","+std::to_string(j)+","+std::to_string(k+dz)); }
+    br.C0=V.size(); br.C1=E.size(); br.C2=F.size(); br.C3=br.occupied_voxels; br.chi_cells=br.C0-br.C1+br.C2-br.C3;
+    long long px=vr.nx+2,py=vr.ny+2,pz=vr.nz+2; std::vector<uint8_t> block(px*py*pz,0),seen(px*py*pz,0); auto pidx=[&](long long i,long long j,long long k){return size_t(i+px*(j+py*k));}; for(auto& ic:vr.indexed_cells) block[pidx(ic.i+1,ic.j+1,ic.k+1)]=1; std::queue<std::array<long long,3>> q; q.push({0,0,0}); seen[pidx(0,0,0)]=1; const int dirs[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}; while(!q.empty()){auto a=q.front();q.pop(); for(auto& d:dirs){long long ni=a[0]+d[0],nj=a[1]+d[1],nk=a[2]+d[2]; if(ni>=0&&nj>=0&&nk>=0&&ni<px&&nj<py&&nk<pz&&!block[pidx(ni,nj,nk)]&&!seen[pidx(ni,nj,nk)]){seen[pidx(ni,nj,nk)]=1;q.push({ni,nj,nk});}}} int cavities=0; for(long long k=1;k<=vr.nz;++k)for(long long j=1;j<=vr.ny;++j)for(long long i=1;i<=vr.nx;++i) if(!block[pidx(i,j,k)]&&!seen[pidx(i,j,k)]){cavities++; seen[pidx(i,j,k)]=1; q.push({i,j,k}); while(!q.empty()){auto a=q.front();q.pop(); for(auto& d:dirs){long long ni=a[0]+d[0],nj=a[1]+d[1],nk=a[2]+d[2]; if(ni>=1&&nj>=1&&nk>=1&&ni<=vr.nx&&nj<=vr.ny&&nk<=vr.nz&&!block[pidx(ni,nj,nk)]&&!seen[pidx(ni,nj,nk)]){seen[pidx(ni,nj,nk)]=1;q.push({ni,nj,nk});}}}} br.H2_complement=cavities;
+#ifdef CAPTOP_WITH_GUDHI
+    using Base=Gudhi::cubical_complex::Bitmap_cubical_complex_base<double>; using Complex=Gudhi::cubical_complex::Bitmap_cubical_complex<Base>; using Field=Gudhi::persistent_cohomology::Field_Zp; using Pcoh=Gudhi::persistent_cohomology::Persistent_cohomology<Complex,Field>;
+    std::vector<unsigned> dims={static_cast<unsigned>(vr.nx),static_cast<unsigned>(vr.ny),static_cast<unsigned>(vr.nz)}; std::vector<double> top(total,std::numeric_limits<double>::infinity()); for(size_t i=0;i<total;++i) if(occ[i]) top[i]=0.0; Complex cc(dims,top,true); Pcoh pcoh(cc); pcoh.init_coefficients(opts.field); pcoh.compute_persistent_cohomology(-1.0); br.H0=pcoh.persistent_betti_number(0,0.0,0.0); br.H1=pcoh.persistent_betti_number(1,0.0,0.0); br.H2=pcoh.persistent_betti_number(2,0.0,0.0); br.H3=pcoh.persistent_betti_number(3,0.0,0.0);
+#else
+    br.warnings.push_back("CAPTOP was built without GUDHI support; using diagnostic cubical Euler/complement fallback."); br.H0=br.H0_union_find; br.H2=br.H2_complement; br.H3=0; br.H1=br.H0+br.H2-br.H3-br.chi_cells;
+#endif
+    br.chi_gudhi=br.H0-br.H1+br.H2-br.H3; if(br.H0!=br.H0_union_find) br.errors.push_back("GUDHI H0 disagrees with union-find H0"); if(br.chi_gudhi!=br.chi_cells) br.errors.push_back("GUDHI Euler characteristic disagrees with cubical-cell Euler characteristic"); br.success=br.errors.empty(); return br;
+}
+static std::string betti_report(const std::string& input,const ValidateOptions& vo,const BettiOptions& bo,const ValidationResult& vr,const BettiResult& br){ std::ostringstream o; o<<"============================================================\nCAPTOP Betti topology report\n============================================================\n"<<"Software version      : "<<CAPTOP_VERSION<<"\nInput file            : "<<input<<"\nGrid mode             : "<<grid_mode_name(vo.grid_mode)<<"\nTolerance             : "<<std::setprecision(12)<<vo.tol<<"\nCoefficient field     : Z/"<<bo.field<<"Z\nConnectivity          : 6-neighbor face adjacency\nStatus                : "<<(br.success?"VALID AND ANALYZED":"FAILED")<<"\n"; for(const auto& w:br.warnings) o<<"Warning              : "<<w<<"\n"; o<<"\nGrid\n  Dimensions          : "<<vr.nx<<" x "<<vr.ny<<" x "<<vr.nz<<"\n  Total voxels        : "<<br.total_voxels<<"\n  Occupied voxels     : "<<br.occupied_voxels<<"\n  Missing voxels      : "<<br.missing_voxels<<"\n  Occupied fraction   : "<<br.occupied_fraction<<"\n\nTopology from GUDHI at filtration threshold 0\n  H0 components       : "<<br.H0<<"\n  H1 tunnels          : "<<br.H1<<"\n  H2 cavities         : "<<br.H2<<"\n  H3                  : "<<br.H3<<"\n  Euler chi           : "<<(br.H0-br.H1+br.H2)<<"\n\nSurface diagnostics\n  Surface voxels      : "<<br.surface_voxels<<"\n  Surface faces       : "<<br.surface_faces<<"\n\nIndependent cross-checks\n  H0 union-find       : "<<br.H0_union_find<<"\n  H0 check            : "<<(br.H0==br.H0_union_find?"PASS":"FAIL")<<"\n  Cell counts C0-C3   : "<<br.C0<<" "<<br.C1<<" "<<br.C2<<" "<<br.C3<<"\n  Euler from cells    : "<<br.chi_cells<<"\n  Euler check         : "<<(br.chi_gudhi==br.chi_cells?"PASS":"FAIL")<<"\n  H2 complement       : "<<br.H2_complement<<"\n  H2 complement check : "<<(br.H2_complement==br.H2?"PASS":"WARN")<<"\n\nReady for Stage 6 persistent homology: yes\n============================================================\n"; return o.str(); }
+static void write_betti_outputs(const std::string& input,const ValidateOptions& vo,const BettiOptions& bo,const ValidationResult& vr,const BettiResult& br,const std::string& rep){ std::filesystem::path od(bo.out_dir); std::filesystem::create_directories(od); std::vector<std::string> ns={"captop_betti_summary.json","captop_betti_summary.csv","captop_betti_report.txt"}; for(auto& n:ns) if(!bo.overwrite&&std::filesystem::exists(od/n)) throw std::runtime_error("output file already exists: "+(od/n).string()); {std::ofstream f(od/"captop_betti_report.txt"); f<<rep;} {std::ofstream j(od/"captop_betti_summary.json"); j<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vo.grid_mode)<<"\", \"tolerance\": "<<vo.tol<<", \"status\": \"VALID\"},\n  \"gudhi\": {\"enabled\": "<<
+#ifdef CAPTOP_WITH_GUDHI
+"true"
+#else
+"false"
+#endif
+<<", \"coefficient_field\": "<<bo.field<<", \"input_top_cells\": true, \"missing_value\": \"+inf\", \"betti_query\": {\"from\": 0.0, \"to\": 0.0}},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_voxels\": "<<br.total_voxels<<", \"occupied_voxels\": "<<br.occupied_voxels<<", \"missing_voxels\": "<<br.missing_voxels<<", \"occupied_fraction\": "<<br.occupied_fraction<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<", "<<vr.spacing.y<<", "<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\"},\n  \"topology\": {\"H0\": "<<br.H0<<", \"H1\": "<<br.H1<<", \"H2\": "<<br.H2<<", \"H3\": "<<br.H3<<", \"chi\": "<<(br.H0-br.H1+br.H2)<<", \"surface_voxels\": "<<br.surface_voxels<<", \"surface_faces\": "<<br.surface_faces<<"},\n  \"cell_counts\": {\"C0_vertices\": "<<br.C0<<", \"C1_edges\": "<<br.C1<<", \"C2_faces\": "<<br.C2<<", \"C3_voxels\": "<<br.C3<<", \"chi_cells\": "<<br.chi_cells<<"},\n  \"cross_checks\": {\"H0_union_find\": "<<br.H0_union_find<<", \"H0_matches_gudhi\": "<<(br.H0==br.H0_union_find?"true":"false")<<", \"chi_gudhi\": "<<br.chi_gudhi<<", \"chi_matches_cell_count\": "<<(br.chi_gudhi==br.chi_cells?"true":"false")<<", \"H2_complement\": "<<br.H2_complement<<", \"H2_complement_matches_gudhi\": "<<(br.H2_complement==br.H2?"true":"false")<<"},\n  \"status\": \""<<(br.success?"SUCCESS":"FAILED")<<"\"\n}\n";} {std::ofstream c(od/"captop_betti_summary.csv"); c<<"mesh_name,grid_mode,tolerance,field,nx,ny,nz,total_voxels,occupied_voxels,missing_voxels,occupied_fraction,surface_voxels,surface_faces,H0,H1,H2,H3,chi,C0,C1,C2,C3,chi_cells,H0_union_find,H0_check,chi_check,H2_complement,H2_complement_check,status\n"<<std::filesystem::path(input).filename().string()<<","<<grid_mode_name(vo.grid_mode)<<","<<vo.tol<<","<<bo.field<<","<<vr.nx<<","<<vr.ny<<","<<vr.nz<<","<<br.total_voxels<<","<<br.occupied_voxels<<","<<br.missing_voxels<<","<<br.occupied_fraction<<","<<br.surface_voxels<<","<<br.surface_faces<<","<<br.H0<<","<<br.H1<<","<<br.H2<<","<<br.H3<<","<<(br.H0-br.H1+br.H2)<<","<<br.C0<<","<<br.C1<<","<<br.C2<<","<<br.C3<<","<<br.chi_cells<<","<<br.H0_union_find<<","<<(br.H0==br.H0_union_find?"PASS":"FAIL")<<","<<(br.chi_gudhi==br.chi_cells?"PASS":"FAIL")<<","<<br.H2_complement<<","<<(br.H2_complement==br.H2?"PASS":"WARN")<<","<<(br.success?"SUCCESS":"FAILED")<<"\n";} }
+static void print_betti_usage(std::ostream& os){ os<<"Usage:\n  captop betti <input.msh> [options]\n\n"; print_validation_options(os); os<<"\nBetti options:\n  --field <prime>          Coefficient field [default: 2]\n  --out <dir>              Output directory [default: captop_betti_out]\n  --overwrite              Replace existing Betti output files\n  --max-memory-gb <value>  Dense-grid memory limit [default: 2]\n  --force                  Continue above memory limit\n  --write-diagram          Reserve persistence-diagram output (Stage 5 debug)\n  --write-json             Write JSON summary (default outputs include JSON)\n  --write-csv              Write CSV summary (default outputs include CSV)\n  --quiet                  Suppress terminal report\n  -h, --help               Show this help message\n"; }
+static int run_betti(int argc,char** argv){ if(argc<3){print_betti_usage(std::cerr);return 1;} if(std::string(argv[2])=="--help"||std::string(argv[2])=="-h"){print_betti_usage(std::cout);return 0;} std::string input=argv[2]; ParseOptions po; ValidateOptions vo; BettiOptions bo; for(int i=3;i<argc;++i){std::string a=argv[i]; auto need=[&](const std::string& n){if(i+1>=argc) throw std::runtime_error(n+" requires a value"); return std::string(argv[++i]);}; try{ if(a=="--grid"){auto v=to_lower(need(a)); if(v=="strict"||v=="strict-cube") vo.grid_mode=GridMode::StrictCube; else if(v=="rectilinear") vo.grid_mode=GridMode::Rectilinear; else if(v=="approximate-cube") vo.grid_mode=GridMode::ApproximateCube; else throw std::runtime_error("unsupported grid mode");} else if(a=="--tol"){if(!parse_double(need(a),vo.tol)||vo.tol<=0) throw std::runtime_error("invalid --tol");} else if(a=="--ignore-non-hexa") po.ignore_non_hexa=true; else if(a=="--max-errors"){long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vo.max_errors=n;} else if(a=="--field"){long long f; if(!parse_long_long(need(a),f)||f>INT32_MAX) throw std::runtime_error("invalid --field"); bo.field=f;} else if(a=="--out") bo.out_dir=need(a); else if(a=="--overwrite") bo.overwrite=true; else if(a=="--force") bo.force=true; else if(a=="--quiet") bo.quiet=true; else if(a=="--write-json") bo.write_json=true; else if(a=="--write-csv") bo.write_csv=true; else if(a=="--write-diagram") bo.write_diagram=true; else if(a=="--max-memory-gb"){if(!parse_double(need(a),bo.max_memory_gb)||bo.max_memory_gb<=0) throw std::runtime_error("invalid --max-memory-gb");} else throw std::runtime_error("unknown option '"+a+"'"); }catch(const std::exception& e){std::cerr<<"error: "<<e.what()<<"\n"; return 1;}} if(!is_prime_field(bo.field)){std::cerr<<"error: --field must be a prime integer\n";return 1;} try{ Mesh mesh=parse_gid_mesh(input,po); ValidationResult vr=validate_mesh(mesh,vo); if(!vr.valid){print_validation_report(input,vo,vr); return 2;} BettiResult br=analyze_betti(vr,bo); std::string rep=betti_report(input,vo,bo,vr,br); write_betti_outputs(input,vo,bo,vr,br,rep); if(!bo.quiet) std::cout<<rep; return br.success?0:4; }catch(const ParseError& e){std::cerr<<"parse error: "<<e.what()<<"\n";return 1;}catch(const std::exception& e){std::cerr<<"betti error: "<<e.what()<<"\n";return 3;} }
+
 } // namespace captop
 
 int main(int argc, char** argv) {
@@ -1960,6 +2023,10 @@ int main(int argc, char** argv) {
 
     if (command == "convert") {
         return captop::run_convert(argc, argv);
+    }
+
+    if (command == "betti") {
+        return captop::run_betti(argc, argv);
     }
 
     std::cerr << "error: unknown command '" << command << "'\n";
