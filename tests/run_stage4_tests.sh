@@ -3,6 +3,11 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 g++ -std=c++17 -O2 -Wall -Wextra -pedantic captop.cpp -o captop
+./captop --help | grep -q -- "Convert options:"
+./captop --help | grep -q -- "--filtration <policy>"
+./captop convert --help | grep -q -- "--out <dir>"
+./captop convert --help | grep -q -- "--threshold-op <op>"
+./captop convert --help | grep -q -- "--cube-rel-tol"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 make_mesh(){ python3 - "$@" <<'PY'

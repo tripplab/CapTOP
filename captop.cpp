@@ -1442,6 +1442,48 @@ static void print_version() {
     std::cout << "GUDHI integration: not enabled in stage 4\n";
 }
 
+static void print_validation_options(std::ostream& os) {
+    os << "Validation options:\n";
+    os << "  --grid strict-cube       Exact equal-edge cubes on a uniform lattice [default]\n";
+    os << "  --grid approximate-cube  Axis-aligned cells nearly cubic within --cube-rel-tol\n";
+    os << "  --grid rectilinear       Axis-aligned rectangular cells on rectilinear axes for topology-first analysis\n";
+    os << "                            (legacy alias: --grid strict maps to strict-cube)\n";
+    os << "  --tol <value>            Coordinate/snapping tolerance [default: 1e-8]\n";
+    os << "  --cube-rel-tol <value>   Relative side-length spread tolerated in approximate-cube mode [default: 0.02]\n";
+    os << "  --ignore-non-hexa        Ignore unsupported non-hexahedral mesh blocks\n";
+    os << "  --max-errors <N>         Maximum number of validation errors to print [default: 30]\n";
+}
+
+static void print_convert_options(std::ostream& os) {
+    os << "Convert options:\n";
+    os << "  --out <dir>              Output directory [default: captop_out]\n";
+    os << "  --filtration <policy>    Filtration policy: occupancy, material, scalar-file, or binary-threshold [default: occupancy]\n";
+    os << "  --selected-material <N>  For material filtration, include only the selected material as finite\n";
+    os << "  --scalar-file <csv>      CSV containing element_id,value columns for scalar-file or binary-threshold filtration\n";
+    os << "  --threshold <value>      Threshold value required by binary-threshold filtration\n";
+    os << "  --threshold-op <op>      Threshold operator: lt, le, gt, ge, eq, or ne [default: ge]\n";
+    os << "  --missing-value inf      Missing cell value; only inf is supported\n";
+    os << "  --overwrite              Replace existing CAPTOP output files in --out\n";
+    os << "  --force                  Continue when the dense memory estimate exceeds --max-memory-gb\n";
+    os << "  --max-memory-gb <value>  Dense-grid memory limit before --force is required [default: 4]\n";
+}
+
+static void print_validate_usage(std::ostream& os) {
+    os << "Usage:\n";
+    os << "  captop validate <input.msh> [options]\n\n";
+    print_validation_options(os);
+    os << "  -h, --help               Show this help message\n";
+}
+
+static void print_convert_usage(std::ostream& os) {
+    os << "Usage:\n";
+    os << "  captop convert <input.msh> [options]\n\n";
+    print_validation_options(os);
+    os << "\n";
+    print_convert_options(os);
+    os << "  -h, --help               Show this help message\n";
+}
+
 static void print_usage(std::ostream& os) {
     os << "CAPTOP - Cubical Analysis Pipeline for Topology\n\n";
     os << "Usage:\n";
@@ -1451,15 +1493,9 @@ static void print_usage(std::ostream& os) {
     os << "Commands:\n";
     os << "  validate                 Parse GiD ASCII mesh and validate cubic-grid compatibility\n";
     os << "  convert                  Convert validated mesh to dense indexed cubical bitmap files\n\n";
-    os << "Options for validate:\n";
-    os << "  --grid strict-cube       Exact equal-edge cubes on a uniform lattice [default]\n";
-    os << "  --grid approximate-cube  Axis-aligned cells nearly cubic within --cube-rel-tol\n";
-    os << "  --grid rectilinear       Axis-aligned rectangular cells on rectilinear axes for topology-first analysis\n";
-    os << "                            (legacy alias: --grid strict maps to strict-cube)\n";
-    os << "  --tol <value>            Coordinate/snapping tolerance [default: 1e-8]\n";
-    os << "  --cube-rel-tol <value>   Relative side-length spread tolerated in approximate-cube mode [default: 0.02]\n";
-    os << "  --ignore-non-hexa        Ignore unsupported non-hexahedral mesh blocks\n";
-    os << "  --max-errors <N>         Maximum number of validation errors to print [default: 30]\n";
+    print_validation_options(os);
+    os << "\n";
+    print_convert_options(os);
     os << "  -h, --help               Show this help message\n";
 }
 
@@ -1678,7 +1714,7 @@ static int run_validate(int argc, char** argv) {
     }
 
     if (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
-        print_usage(std::cout);
+        print_validate_usage(std::cout);
         return 0;
     }
 
@@ -1850,13 +1886,15 @@ static std::string conversion_report(const std::string& input,const std::string&
 }
 
 static int run_convert(int argc,char** argv){
-    if(argc<3){ print_usage(std::cerr); return 1; }
+    if(argc<3){ print_convert_usage(std::cerr); return 1; }
+    if(std::string(argv[2])=="--help" || std::string(argv[2])=="-h") { print_convert_usage(std::cout); return 0; }
     std::string input=argv[2]; ParseOptions popts; ValidateOptions vopts; ConvertOptions copts;
     for(int i=3;i<argc;++i){ std::string a=argv[i];
         auto need=[&](const std::string& n){ if(i+1>=argc) throw std::runtime_error(n+" requires a value"); return std::string(argv[++i]); };
         try{
         if(a=="--grid"){ auto v=to_lower(need(a)); if(v=="strict"||v=="strict-cube") vopts.grid_mode=GridMode::StrictCube; else if(v=="rectilinear") vopts.grid_mode=GridMode::Rectilinear; else if(v=="approximate-cube") vopts.grid_mode=GridMode::ApproximateCube; else throw std::runtime_error("unsupported grid mode '"+v+"'"); }
         else if(a=="--tol"){ if(!parse_double(need(a),vopts.tol)||vopts.tol<=0) throw std::runtime_error("invalid --tol"); }
+        else if(a=="--cube-rel-tol"){ if(!parse_double(need(a),vopts.cube_rel_tol)||vopts.cube_rel_tol<0) throw std::runtime_error("invalid --cube-rel-tol"); }
         else if(a=="--ignore-non-hexa") popts.ignore_non_hexa=true;
         else if(a=="--max-errors"){ long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vopts.max_errors=n; }
         else if(a=="--out") copts.out_dir=need(a);
