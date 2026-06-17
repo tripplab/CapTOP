@@ -420,8 +420,13 @@ Reported descriptors include:
 - Closed-cube `H0_closed` (26-neighbor) and face-adjacency `H0_face`
   (6-neighbor) union-find diagnostics.
 - Contact audit counts for face, edge, and vertex contacts.
+- Raw inter-component contact counts for occupied voxel pairs whose
+  6-neighbor face-adjacency components differ.
 - A deterministic merger audit explaining reductions from `H0_face` to
-  `H0_closed` when edge/vertex contacts merge face components.
+  `H0_closed` when an independent subset of edge/vertex contacts merges face
+  components. A mesh can have many raw contacts, for example 30 raw
+  inter-component contacts, but only 6 merger records if many contacts join
+  components already merged by earlier contacts.
 - Cubical-cell Euler characteristic, GUDHI Euler characteristic, and cross-check
   status.
 - Complement flood-fill `H2` diagnostic.
@@ -454,9 +459,28 @@ captop_betti_summary.json
 captop_betti_summary.csv
 captop_betti_report.txt
 captop_contact_audit_summary.json
-captop_contact_mergers.csv
-captop_contact_contacts.csv
 ```
+
+Detailed contact CSV files are written when `--write-contact-audit` is passed,
+when `H0_face != H0_closed`, when GUDHI `H0` disagrees with `H0_closed`, or when
+contact-audit consistency checks fail:
+
+```text
+captop_contact_mergers.csv   independent merger records
+captop_contact_contacts.csv  all raw inter-component contacts
+```
+
+Glossary:
+
+- `face-adjacency component`: a component under 6-neighbor voxel connectivity.
+- `closed-cube component`: a component under closed-cube 26-neighbor
+  connectivity.
+- `raw contact`: an edge or vertex contact between two distinct face-adjacency
+  components.
+- `merger record`: a raw contact selected by the face-component union-find that
+  actually reduces the component count.
+- `component reduction`: `H0_face - H0_closed`, which must match the number of
+  independent merger records in a valid contact audit.
 
 Exit statuses for `betti` are:
 
