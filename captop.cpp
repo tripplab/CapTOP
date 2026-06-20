@@ -274,6 +274,25 @@ static std::vector<std::string> tokenize_gid_line(const std::string& line) {
     return tokens;
 }
 
+
+static std::string strip_octreemesh_comment(const std::string& line) {
+    const std::size_t pos = line.find(';');
+    if (pos == std::string::npos) {
+        return trim(line);
+    }
+    return trim(line.substr(0, pos));
+}
+
+static std::vector<std::string> tokenize_plain_line(const std::string& line) {
+    std::istringstream iss(line);
+    std::vector<std::string> tokens;
+    std::string tok;
+    while (iss >> tok) {
+        tokens.push_back(tok);
+    }
+    return tokens;
+}
+
 static bool parse_long_long(const std::string& s, long long& out) {
     char* end = nullptr;
     errno = 0;
@@ -579,6 +598,213 @@ static Mesh parse_gid_mesh(const std::string& path, const ParseOptions& opts) {
     }
 
     return mesh;
+}
+
+
+static std::string first_significant_line(const std::string& path) {
+    std::ifstream in(path.c_str());
+    if (!in) {
+        throw ParseError("cannot open input file '" + path + "'");
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string stripped = trim(line);
+        if (stripped.empty() || starts_with_case_insensitive(stripped, "#")) {
+            continue;
+        }
+        const std::string without_octree_comment = strip_octreemesh_comment(stripped);
+        if (without_octree_comment.empty()) {
+            continue;
+        }
+        return without_octree_comment;
+    }
+
+    throw ParseError("input file '" + path + "' is empty or contains only comments");
+}
+
+static Mesh parse_octreemesh_file(const std::string& path, const ParseOptions&) {
+    std::ifstream in(path.c_str());
+    if (!in) {
+        throw ParseError("cannot open input file '" + path + "'");
+    }
+
+    Mesh mesh;
+    MeshBlock block;
+    block.id = 0;
+    block.dimension = 3;
+    block.elemtype = "Hexahedra";
+    block.nnode = 8;
+    block.supported_hexa = true;
+    mesh.blocks.push_back(block);
+
+    auto next_data_line = [&](std::string& out, std::size_t& out_line) -> bool {
+        std::string line;
+        while (std::getline(in, line)) {
+            ++out_line;
+            const std::string stripped = strip_octreemesh_comment(line);
+            if (stripped.empty()) {
+                continue;
+            }
+            out = stripped;
+            return true;
+        }
+        return false;
+    };
+
+    std::string line;
+    std::size_t line_number = 0;
+
+    if (!next_data_line(line, line_number) || line != "{Nodes}") {
+        throw ParseError(line_context(line_number, "OctreeMesh file must start with {Nodes}"));
+    }
+    mesh.blocks[0].line_number = line_number;
+
+    if (!next_data_line(line, line_number)) {
+        throw ParseError("unexpected end of OctreeMesh file while reading node dimension");
+    }
+    int dimension = 0;
+    {
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 1 || !parse_int(tokens[0], dimension)) {
+            throw ParseError(line_context(line_number, "OctreeMesh node dimension must be a single integer"));
+        }
+    }
+    if (dimension != 3) {
+        throw ParseError(line_context(line_number, "OctreeMesh dimension " + std::to_string(dimension) + " is not supported; only 3 is supported"));
+    }
+    mesh.blocks[0].dimension = dimension;
+
+    if (!next_data_line(line, line_number)) {
+        throw ParseError("unexpected end of OctreeMesh file while reading nodes count");
+    }
+    long long node_count_ll = 0;
+    {
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 1 || !parse_long_long(tokens[0], node_count_ll) || node_count_ll < 0) {
+            throw ParseError(line_context(line_number, "OctreeMesh nodes count must be a non-negative integer"));
+        }
+    }
+    const std::size_t node_count = static_cast<std::size_t>(node_count_ll);
+    std::cerr << "Parsing OctreeMesh nodes: " << node_count << "\n";
+
+    for (std::size_t i = 0; i < node_count; ++i) {
+        if (!next_data_line(line, line_number)) {
+            throw ParseError("unexpected end of OctreeMesh file while reading node " + std::to_string(i + 1));
+        }
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 3) {
+            throw ParseError(line_context(line_number, "OctreeMesh node " + std::to_string(i + 1) + " must contain exactly 3 coordinates"));
+        }
+        double x = 0.0, y = 0.0, z = 0.0;
+        if (!parse_double(tokens[0], x) || !parse_double(tokens[1], y) || !parse_double(tokens[2], z)) {
+            throw ParseError(line_context(line_number, "OctreeMesh node " + std::to_string(i + 1) + " has invalid coordinate value"));
+        }
+        const long long node_id = static_cast<long long>(i + 1);
+        Node n;
+        n.original_id = node_id;
+        n.p = Vec3{x, y, z};
+        mesh.nodes.insert(std::make_pair(node_id, n));
+    }
+    std::cerr << "Finished OctreeMesh nodes: " << mesh.nodes.size() << "\n";
+
+    if (!next_data_line(line, line_number) || line != "{Mesh}") {
+        throw ParseError(line_context(line_number, "OctreeMesh {Mesh} section must follow the {Nodes} section"));
+    }
+
+    if (!next_data_line(line, line_number)) {
+        throw ParseError("unexpected end of OctreeMesh file while reading element type");
+    }
+    int element_type = 0;
+    {
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 1 || !parse_int(tokens[0], element_type)) {
+            throw ParseError(line_context(line_number, "OctreeMesh element type must be a single integer"));
+        }
+    }
+    if (element_type != 5) {
+        throw ParseError(line_context(line_number, "OctreeMesh element type " + std::to_string(element_type) + " is not supported; only 5=Hexahedra is supported"));
+    }
+
+    if (!next_data_line(line, line_number)) {
+        throw ParseError("unexpected end of OctreeMesh file while reading nodes per element");
+    }
+    int nodes_per_element = 0;
+    {
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 1 || !parse_int(tokens[0], nodes_per_element)) {
+            throw ParseError(line_context(line_number, "OctreeMesh nodes per element must be a single integer"));
+        }
+    }
+    if (nodes_per_element != 8) {
+        throw ParseError(line_context(line_number, "OctreeMesh nodes per element " + std::to_string(nodes_per_element) + " is not supported; only 8 is supported"));
+    }
+    mesh.blocks[0].nnode = nodes_per_element;
+
+    if (!next_data_line(line, line_number)) {
+        throw ParseError("unexpected end of OctreeMesh file while reading elements count");
+    }
+    long long element_count_ll = 0;
+    {
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 1 || !parse_long_long(tokens[0], element_count_ll) || element_count_ll < 0) {
+            throw ParseError(line_context(line_number, "OctreeMesh elements count must be a non-negative integer"));
+        }
+    }
+    const std::size_t element_count = static_cast<std::size_t>(element_count_ll);
+    mesh.blocks[0].element_count = element_count;
+    std::cerr << "Parsing OctreeMesh elements: " << element_count << "\n";
+
+    for (std::size_t i = 0; i < element_count; ++i) {
+        if (!next_data_line(line, line_number)) {
+            throw ParseError("unexpected end of OctreeMesh file while reading element " + std::to_string(i + 1));
+        }
+        const std::vector<std::string> tokens = tokenize_plain_line(line);
+        if (tokens.size() != 9) {
+            throw ParseError(line_context(line_number, "OctreeMesh element " + std::to_string(i + 1) + " must contain exactly material plus 8 node ids"));
+        }
+
+        HexElement h;
+        h.original_id = static_cast<long long>(i + 1);
+        h.mesh_block_id = 0;
+        h.line_number = line_number;
+        h.has_material = true;
+        if (!parse_long_long(tokens[0], h.material)) {
+            throw ParseError(line_context(line_number, "OctreeMesh element " + std::to_string(i + 1) + " has invalid material id"));
+        }
+        for (std::size_t k = 0; k < 8; ++k) {
+            long long nid = 0;
+            if (!parse_long_long(tokens[1 + k], nid)) {
+                throw ParseError(line_context(line_number, "OctreeMesh element " + std::to_string(i + 1) + " has invalid node id '" + tokens[1 + k] + "'"));
+            }
+            if (nid < 1 || nid > node_count_ll) {
+                throw ParseError(line_context(line_number, "OctreeMesh element " + std::to_string(i + 1) + " references node id " + std::to_string(nid) + " outside valid range 1.." + std::to_string(node_count_ll)));
+            }
+            h.node_ids[k] = nid;
+        }
+        mesh.hexes.push_back(h);
+    }
+    std::cerr << "Finished OctreeMesh elements: " << mesh.hexes.size() << "\n";
+
+    std::string extra;
+    std::size_t extra_line = line_number;
+    if (next_data_line(extra, extra_line)) {
+        throw ParseError(line_context(extra_line, "unexpected data after OctreeMesh elements section"));
+    }
+
+    return mesh;
+}
+
+static Mesh parse_mesh_file(const std::string& path, const ParseOptions& opts) {
+    const std::string first = first_significant_line(path);
+    const std::string lower = to_lower(first);
+    if (starts_with_case_insensitive(lower, "mesh")) {
+        return parse_gid_mesh(path, opts);
+    }
+    if (first == "{Nodes}") {
+        return parse_octreemesh_file(path, opts);
+    }
+    throw ParseError("unsupported mesh format in '" + path + "'; expected GiD 'mesh' header or OctreeMesh {Nodes} header");
 }
 
 static std::vector<double> unique_sorted_tol(std::vector<double> values, double tol) {
@@ -1481,15 +1707,15 @@ static void print_convert_options(std::ostream& os) {
 
 static void print_validate_usage(std::ostream& os) {
     os << "Usage:\n";
-    os << "  captop validate <input.msh> [options]\n\n";
+    os << "  captop validate <input-mesh> [options]\n\n";
     print_validation_options(os);
     os << "  -h, --help               Show this help message\n";
 }
 
 static void print_convert_usage(std::ostream& os) {
     os << "Usage:\n";
-    os << "  captop convert <input.msh> [options]\n";
-    os << "  captop betti <input.msh> [options]\n\n";
+    os << "  captop convert <input-mesh> [options]\n";
+    os << "  captop betti <input-mesh> [options]\n\n";
     print_validation_options(os);
     os << "\n";
     print_convert_options(os);
@@ -1510,11 +1736,11 @@ static void print_usage(std::ostream& os) {
     os << "CAPTOP - Cubical Analysis Pipeline for Topology\n\n";
     os << "Usage:\n";
     os << "  captop --version\n";
-    os << "  captop validate <input.msh> [options]\n";
-    os << "  captop convert <input.msh> [options]\n";
-    os << "  captop betti <input.msh> [options]\n\n";
+    os << "  captop validate <input-mesh> [options]\n";
+    os << "  captop convert <input-mesh> [options]\n";
+    os << "  captop betti <input-mesh> [options]\n\n";
     os << "Commands:\n";
-    os << "  validate                 Parse GiD ASCII mesh and validate cubic-grid compatibility\n";
+    os << "  validate                 Parse GiD ASCII or OctreeMesh input and validate cubic-grid compatibility\n";
     os << "  convert                  Convert validated mesh to dense indexed cubical bitmap files\n";
     os << "  betti                   Compute Stage 5 occupied-domain Betti descriptors\n\n";
     print_validation_options(os);
@@ -1828,7 +2054,7 @@ static int run_validate(int argc, char** argv) {
     }
 
     try {
-        Mesh mesh = parse_gid_mesh(input_path, parse_opts);
+        Mesh mesh = parse_mesh_file(input_path, parse_opts);
         ValidationResult result = validate_mesh(mesh, validate_opts);
         print_validation_report(input_path, validate_opts, result);
         return result.valid ? 0 : 2;
@@ -1948,7 +2174,7 @@ static int run_convert(int argc,char** argv){
         if((copts.filtration=="scalar-file"||copts.filtration=="binary-threshold") && copts.scalar_file.empty()) throw std::runtime_error("--filtration "+copts.filtration+" requires --scalar-file");
         if(copts.filtration=="binary-threshold" && !copts.has_threshold) throw std::runtime_error("--filtration binary-threshold requires --threshold");
         if(copts.filtration!="occupancy"&&copts.filtration!="material"&&copts.filtration!="scalar-file"&&copts.filtration!="binary-threshold") throw std::runtime_error("unknown filtration policy '"+copts.filtration+"'");
-        Mesh mesh=parse_gid_mesh(input,popts); ValidationResult vr=validate_mesh(mesh,vopts); if(!vr.valid){ print_validation_report(input,vopts,vr); return 2; }
+        Mesh mesh=parse_mesh_file(input,popts); ValidationResult vr=validate_mesh(mesh,vopts); if(!vr.valid){ print_validation_report(input,vopts,vr); return 2; }
         if(vr.nx<=0||vr.ny<=0||vr.nz<=0) throw std::runtime_error("grid dimensions must be positive");
         size_t sx=vr.nx, sy=vr.ny, sz=vr.nz; if(sx>std::numeric_limits<size_t>::max()/sy || sx*sy>std::numeric_limits<size_t>::max()/sz) throw std::runtime_error("integer overflow in nx * ny * nz");
         size_t total=sx*sy*sz, bytes=total*sizeof(GridCell); double limit=copts.max_memory_gb*1024.0*1024.0*1024.0; if(bytes>limit&&!copts.force) throw std::runtime_error("dense memory estimate exceeds --max-memory-gb; use --force to override");
@@ -2811,7 +3037,7 @@ static void write_betti_outputs(const std::string &input,
   }
 }
 static void print_betti_usage(std::ostream &os) {
-  os << "Usage:\n  captop betti <input.msh> [options]\n\nComputes plain "
+  os << "Usage:\n  captop betti <input-mesh> [options]\n\nComputes plain "
         "topology descriptors for binary occupied domains.\n\nIf CAPTOP is "
         "built with GUDHI, Betti numbers are computed from\nGUDHI persistent "
         "Betti numbers at filtration threshold 0.\n\nIf CAPTOP is built "
@@ -2929,7 +3155,7 @@ static int run_betti(int argc, char **argv) {
     return 1;
   }
 #endif
-    try{ Mesh mesh=parse_gid_mesh(input,po); ValidationResult vr=validate_mesh(mesh,vo); if(!vr.valid){print_validation_report(input,vo,vr); return 2;} BettiResult br=analyze_betti(vr,bo); std::string rep=betti_report(input,vo,bo,vr,br); write_betti_outputs(input,vo,bo,vr,br,rep); if(!bo.quiet) std::cout<<rep; return br.success?0:4; }catch(const ParseError& e){std::cerr<<"parse error: "<<e.what()<<"\n";return 1;}catch(const std::exception& e){std::cerr<<"betti error: "<<e.what()<<"\n";return 3;}
+    try{ Mesh mesh=parse_mesh_file(input,po); ValidationResult vr=validate_mesh(mesh,vo); if(!vr.valid){print_validation_report(input,vo,vr); return 2;} BettiResult br=analyze_betti(vr,bo); std::string rep=betti_report(input,vo,bo,vr,br); write_betti_outputs(input,vo,bo,vr,br,rep); if(!bo.quiet) std::cout<<rep; return br.success?0:4; }catch(const ParseError& e){std::cerr<<"parse error: "<<e.what()<<"\n";return 1;}catch(const std::exception& e){std::cerr<<"betti error: "<<e.what()<<"\n";return 3;}
 }
 
 } // namespace captop

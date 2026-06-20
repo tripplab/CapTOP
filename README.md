@@ -3,10 +3,10 @@
 by trippm@tripplab.com on june 2026
 
 CapTOP is a small C++ command-line tool for cubical meshes. Its current
-implementation reads GiD ASCII `.msh` files, extracts supported 3D 8-node
-hexahedral elements, validates that those elements can be interpreted as a
-bitmap-style cubical complex, and converts valid meshes into dense indexed
-cubical bitmap files for downstream topology analysis.
+implementation reads GiD ASCII `.msh` files and OctreeMesh geometry data files,
+extracts supported 3D 8-node hexahedral elements, validates that those elements
+can be interpreted as a bitmap-style cubical complex, and converts valid meshes
+into dense indexed cubical bitmap files for downstream topology analysis.
 
 The executable name used throughout this README is `captop`.
 
@@ -21,9 +21,9 @@ captop convert <input.msh> [options]
 
 During validation, CapTOP:
 
-1. Parses GiD ASCII mesh blocks.
-2. Accepts mesh blocks with `dimension = 3`, `elemtype = Hexahedra`, and
-   `nnode = 8`.
+1. Parses GiD ASCII mesh blocks or OctreeMesh `{Nodes}`/`{Mesh}` geometry data.
+2. Accepts 3D 8-node hexahedra: GiD `dimension = 3`, `elemtype = Hexahedra`,
+   `nnode = 8`, or OctreeMesh element type `5` with 8 nodes per element.
 3. Reads node coordinates and hexahedral element connectivity.
 4. Verifies that each hexahedron references 8 distinct, existing nodes.
 5. Checks that every supported element is axis-aligned and occupies exactly one
@@ -64,11 +64,16 @@ equal-spacing voxel/cube model. Use `approximate-cube` for GiD/octree outputs
 with small coordinate-rounding artifacts. Use `rectilinear` for topology-first
 analysis of axis-aligned meshes whose spacing can vary by coordinate interval.
 
-## Supported input format
+## Supported input formats
 
-CapTOP expects GiD-style ASCII mesh content with `mesh`, `coordinates`, and
-`elements` sections. Supported element blocks must be 3D 8-node hexahedra.
-Element records are interpreted as:
+CapTOP auto-detects supported input formats from the first significant line of
+the file.
+
+### GiD ASCII
+
+GiD-style ASCII mesh content uses `mesh`, `coordinates`, and `elements` sections.
+Supported element blocks must be 3D 8-node hexahedra. Element records are
+interpreted as:
 
 ```text
 <element_id> <node_1> <node_2> <node_3> <node_4> <node_5> <node_6> <node_7> <node_8> [material_id]
@@ -77,9 +82,47 @@ Element records are interpreted as:
 The optional tenth value is treated as a material or layer identifier. Extra
 columns after that value are ignored with a warning.
 
-Unsupported mesh blocks are reported as warnings when encountered. By default,
-an element record inside an unsupported block is a parse error. Pass
+Unsupported GiD mesh blocks are reported as warnings when encountered. By
+default, an element record inside an unsupported block is a parse error. Pass
 `--ignore-non-hexa` to skip those element records instead.
+
+### OctreeMesh geometry data
+
+OctreeMesh geometry data uses `{Nodes}` followed by `{Mesh}`. Node IDs are
+implicit, sequential, and 1-based from the coordinate-line order. Element IDs are
+also implicit, sequential, and 1-based from the element-line order. Comments begin
+with `;`, including inline comments after data values. CapTOP prints OctreeMesh
+node and element parsing progress to the terminal while loading the file.
+
+```text
+{Nodes}
+3 ; Dimension
+8 ; Nodes count
+0 0 0
+1 0 0
+1 1 0
+0 1 0
+0 0 1
+1 0 1
+1 1 1
+0 1 1
+
+{Mesh}
+5 ; Element type (5=Hexahedra)
+8 ; Nodes per element
+1 ; Elements count
+1 1 2 3 4 5 6 7 8
+```
+
+OctreeMesh element records are interpreted as:
+
+```text
+<material_id> <node_1> <node_2> <node_3> <node_4> <node_5> <node_6> <node_7> <node_8>
+```
+
+OctreeMesh files must declare dimension `3`, element type `5`, and 8 nodes per
+element. Extra columns are rejected. Non-hexahedral element types are rejected,
+and `{Mesh}` must follow `{Nodes}`.
 
 ## Requirements
 
