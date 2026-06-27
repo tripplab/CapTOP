@@ -597,3 +597,21 @@ substitute for the required GUDHI-backed Stage 5 deliverable. Reports generated
 without GUDHI must not be described as GUDHI Betti results. Use
 `captop betti <input.msh> --require-gudhi` to fail rather than accept
 fallback-only analysis when authoritative GUDHI topology is required.
+
+## Stage 6. Persistent homology
+
+Stage 6 adds `captop persist <input.msh> [options]` for persistent homology on validated GiD hexahedral meshes. It preserves the Stage 5 convention that the primary topology is the closed occupied cubical complex (26-neighbor closed-cube connectivity), while face-adjacent 6-neighbor connectivity remains diagnostic.
+
+Persistent homology is computed from GUDHI bitmap cubical complexes and GUDHI persistent cohomology. Stage 6 requires GUDHI: builds configured with `-DCAPTOP_WITH_GUDHI=OFF` keep the earlier `validate`, `convert`, and `betti` commands, but `persist` exits immediately with instructions to rebuild using `-DCAPTOP_WITH_GUDHI=ON`.
+
+Filtrations are defined on maximal cubes because CAPTOP scalar data is element/voxel-level data. Supported policies are:
+
+* `--filtration occupancy`: occupied cubes have value `0.0`; missing cubes have `+inf`.
+* `--filtration material`: occupied cubes use their material/layer id as a double; missing cubes have `+inf`.
+* `--filtration scalar-file values.csv`: the required CSV header is `element_id,value`, mapping original GiD element ids to finite cube-level scalar values; missing cubes have `+inf`.
+
+Missing cubes are always encoded as `+inf`; CAPTOP does not use finite sentinels, NaN, or interpolation for Stage 6 missing cells. In sublevel mode, finite computational values are the physical scalar values. In superlevel mode, finite values are internally negated for computation and restored to the original physical scalar scale in CSV, JSON, and terminal outputs; missing cubes remain `+inf` and never become `-inf` internally.
+
+Default Stage 6 output includes `persistence_pairs.csv`, `barcode_summary.csv`, per-dimension diagram files for dimensions `0,1,2`, `betti_curve.csv`, `captop_persistence_summary.json`, and `captop_persistence_report.txt`. Homology dimensions can be restricted with `--homology-dim`, and coefficient fields are selected with `--field p`, where `p` must be prime.
+
+For occupancy persistence, the Betti numbers derived from persistence intervals at threshold `0` are intended to match the Stage 5 GUDHI Betti numbers, providing a regression bridge from binary topology to full cubical persistence.
