@@ -43,7 +43,7 @@
 
 namespace captop {
 
-static const char* CAPTOP_VERSION = "0.1.0-stage5";
+static const char* CAPTOP_VERSION = "0.1.0-stage6";
 
 enum class GridMode {
     StrictCube,
@@ -1715,7 +1715,8 @@ static void print_validate_usage(std::ostream& os) {
 static void print_convert_usage(std::ostream& os) {
     os << "Usage:\n";
     os << "  captop convert <input-mesh> [options]\n";
-    os << "  captop betti <input-mesh> [options]\n\n";
+    os << "  captop betti <input-mesh> [options]\n";
+    os << "  captop persist <input-mesh> [options]\n\n";
     print_validation_options(os);
     os << "\n";
     print_convert_options(os);
@@ -1738,11 +1739,12 @@ static void print_usage(std::ostream& os) {
     os << "  captop --version\n";
     os << "  captop validate <input-mesh> [options]\n";
     os << "  captop convert <input-mesh> [options]\n";
-    os << "  captop betti <input-mesh> [options]\n\n";
+    os << "  captop betti <input-mesh> [options]\n";
+    os << "  captop persist <input-mesh> [options]\n\n";
     os << "Commands:\n";
     os << "  validate                 Parse GiD ASCII or OctreeMesh input and validate cubic-grid compatibility\n";
     os << "  convert                  Convert validated mesh to dense indexed cubical bitmap files\n";
-    os << "  betti                   Compute Stage 5 occupied-domain Betti descriptors\n\n";
+    os << "  betti                   Compute Stage 5 occupied-domain Betti descriptors\n  persist                 Compute Stage 6 persistent homology with GUDHI\n\n";
     print_validation_options(os);
     os << "\n";
     print_convert_options(os);
@@ -2198,6 +2200,72 @@ enum class TopologySource { NONE, GUDHI, FALLBACK_DIAGNOSTIC };
 static std::string topology_source_value(TopologySource s){ if(s==TopologySource::GUDHI) return "gudhi"; if(s==TopologySource::FALLBACK_DIAGNOSTIC) return "fallback_diagnostic"; return "none"; }
 static std::string json_string_array(const std::vector<std::string>& xs){ std::ostringstream o; o<<"["; for(size_t i=0;i<xs.size();++i){ if(i) o<<", "; o<<"\""<<json_escape(xs[i])<<"\""; } o<<"]"; return o.str(); }
 static std::string csv_escape(std::string v){ bool q=v.find_first_of(",\n\r\"")!=std::string::npos; size_t pos=0; while((pos=v.find('"',pos))!=std::string::npos){ v.insert(pos,"\""); pos+=2; } return q?"\""+v+"\"":v; }
+
+
+static bool is_prime_field(int p) {
+  if (p < 2) return false;
+  for (int d = 2; d * d <= p; ++d) if (p % d == 0) return false;
+  return true;
+}
+struct PersistOptions {
+  std::string out_dir="captop_persist_out", filtration="occupancy", scalar_file, mode="sublevel", betti_curve_values="unique";
+  std::vector<int> dims{0,1,2};
+  int field=2, betti_curve_samples=200; double min_persistence=0, max_memory_gb=4.0;
+  bool overwrite=false, force=false, quiet=false, write_pairs=false, write_diagrams=false, write_betti_curve=false, write_barcode_summary=false, write_json=false, write_all=false, finite_only=false, include_essential=true;
+};
+struct PersistenceInterval { int dim=0; double bc=0, dc=0, bp=0, dp=0, pers=0; bool inf=false; };
+static std::string fnum(double v){ if(std::isinf(v)) return v>0?"inf":"-inf"; std::ostringstream o; o<<std::setprecision(17)<<v; return o.str(); }
+static std::vector<int> parse_dims(const std::string& s){ std::vector<int> r; std::stringstream ss(s); std::string t; while(std::getline(ss,t,',')){ long long d; if(!parse_long_long(trim(t),d)) throw std::runtime_error("invalid homology dimension '"+t+"'"); if(d<0) throw std::runtime_error("homology dimensions must be nonnegative"); if(d>3) throw std::runtime_error("unsupported homology dimension "+std::to_string(d)+" for 3D cubical grid"); r.push_back((int)d);} if(r.empty()) throw std::runtime_error("--homology-dim cannot be empty"); std::sort(r.begin(),r.end()); r.erase(std::unique(r.begin(),r.end()),r.end()); return r; }
+static bool dim_requested(const PersistOptions& o,int d){ return std::find(o.dims.begin(),o.dims.end(),d)!=o.dims.end(); }
+static std::string dims_csv(const std::vector<int>& d){ std::ostringstream o; for(size_t i=0;i<d.size();++i){ if(i)o<<","; o<<d[i]; } return o.str(); }
+static void print_persist_usage(std::ostream& os){ os<<"Usage:\n  captop persist <input-mesh> [options]\n\nStage 6 persistent homology using GUDHI bitmap cubical complexes.\n\nOptions:\n  --homology-dim <0,1,2,3> [default: 0,1,2]\n  --field <prime> [default: 2]\n  --filtration occupancy|material|scalar-file [file]\n  --scalar-file <csv>\n  --mode sublevel|superlevel [default: sublevel]\n  --min-persistence <epsilon> [default: 0]\n  --out <dir> [default: captop_persist_out]\n  --overwrite --force --quiet --max-memory-gb <gb>\n  --write-pairs --write-diagrams --write-betti-curve --write-barcode-summary --write-json --write-all\n  --betti-curve-samples <N> --betti-curve-values unique|uniform\n  --finite-only --include-essential\n"; print_validation_options(os); }
+
+static int run_persist(int argc,char** argv){
+  if(argc<3){ print_persist_usage(std::cerr); return 1; }
+  if(std::string(argv[2])=="--help"||std::string(argv[2])=="-h"){ print_persist_usage(std::cout); return 0; }
+#ifndef CAPTOP_WITH_GUDHI
+  std::cerr<<"CAPTOP persistent homology requires GUDHI support.\nRebuild with -DCAPTOP_WITH_GUDHI=ON.\n"; return 1;
+#endif
+  std::string input=argv[2]; ParseOptions po; ValidateOptions vo; PersistOptions opt;
+  for(int i=3;i<argc;++i){ std::string a=argv[i]; auto need=[&](const std::string& n){ if(i+1>=argc) throw std::runtime_error(n+" requires a value"); return std::string(argv[++i]);};
+    try{ if(a=="--grid"){ auto v=to_lower(need(a)); if(v=="strict"||v=="strict-cube") vo.grid_mode=GridMode::StrictCube; else if(v=="rectilinear") vo.grid_mode=GridMode::Rectilinear; else throw std::runtime_error("unsupported grid mode"); }
+      else if(a=="--tol"){ if(!parse_double(need(a),vo.tol)||vo.tol<=0) throw std::runtime_error("invalid --tol"); }
+      else if(a=="--ignore-non-hexa") po.ignore_non_hexa=true; else if(a=="--max-errors"){ long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vo.max_errors=n; }
+      else if(a=="--homology-dim") opt.dims=parse_dims(need(a)); else if(a=="--field"){ long long f; if(!parse_long_long(need(a),f)||f>INT32_MAX) throw std::runtime_error("invalid --field"); opt.field=(int)f; }
+      else if(a=="--filtration"){ opt.filtration=need(a); if(opt.filtration=="scalar-file" && i+1<argc && std::string(argv[i+1]).rfind("--",0)!=0) opt.scalar_file=argv[++i]; }
+      else if(a=="--scalar-file") opt.scalar_file=need(a); else if(a=="--mode") opt.mode=to_lower(need(a)); else if(a=="--min-persistence"){ if(!parse_double(need(a),opt.min_persistence)||opt.min_persistence<0) throw std::runtime_error("invalid minimum persistence"); }
+      else if(a=="--out") opt.out_dir=need(a); else if(a=="--overwrite") opt.overwrite=true; else if(a=="--force") opt.force=true; else if(a=="--quiet") opt.quiet=true; else if(a=="--max-memory-gb"){ if(!parse_double(need(a),opt.max_memory_gb)||opt.max_memory_gb<=0) throw std::runtime_error("invalid --max-memory-gb"); }
+      else if(a=="--write-pairs") opt.write_pairs=true; else if(a=="--write-diagrams") opt.write_diagrams=true; else if(a=="--write-betti-curve") opt.write_betti_curve=true; else if(a=="--write-barcode-summary") opt.write_barcode_summary=true; else if(a=="--write-json") opt.write_json=true; else if(a=="--write-all") opt.write_all=true; else if(a=="--finite-only"){ opt.finite_only=true; opt.include_essential=false; } else if(a=="--include-essential") opt.include_essential=true; else if(a=="--essential-death") (void)need(a);
+      else if(a=="--betti-curve-values") opt.betti_curve_values=need(a); else if(a=="--betti-curve-samples"){ long long n; if(!parse_long_long(need(a),n)||n<2) throw std::runtime_error("--betti-curve-samples must be >= 2"); opt.betti_curve_samples=(int)n; } else throw std::runtime_error("unknown option '"+a+"'");
+    }catch(const std::exception& e){ std::cerr<<"error: "<<e.what()<<"\n"; return 1; }}
+  if(!is_prime_field(opt.field)){ std::cerr<<"error: coefficient field must be prime (got "<<opt.field<<")\n"; return 1; }
+  if(opt.mode!="sublevel"&&opt.mode!="superlevel"){ std::cerr<<"error: --mode must be sublevel or superlevel\n"; return 1; }
+  if(opt.filtration=="scalar-file"&&opt.scalar_file.empty()){ std::cerr<<"error: --filtration scalar-file requires --scalar-file or inline CSV path\n"; return 3; }
+  if(opt.filtration!="occupancy"&&opt.filtration!="material"&&opt.filtration!="scalar-file"){ std::cerr<<"error: unsupported filtration policy '"<<opt.filtration<<"'\n"; return 1; }
+  try{
+    auto t0=std::chrono::steady_clock::now(); Mesh mesh=parse_mesh_file(input,po); ValidationResult vr=validate_mesh(mesh,vo); if(!vr.valid){ print_validation_report(input,vo,vr); return 2; }
+    size_t total=(size_t)vr.nx*(size_t)vr.ny*(size_t)vr.nz; if(total*sizeof(double)>opt.max_memory_gb*1024.0*1024*1024&&!opt.force) throw std::runtime_error("dense grid memory estimate exceeds --max-memory-gb; use --force to override");
+    std::vector<double> phys(total,std::numeric_limits<double>::infinity()), comp(total,std::numeric_limits<double>::infinity()); std::unordered_map<long long,double> scalars; if(opt.filtration=="scalar-file") scalars=read_scalar_file(opt.scalar_file);
+    for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); double v=0; if(opt.filtration=="occupancy") v=0; else if(opt.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" lacks material value"); v=(double)ic.material; } else { auto it=scalars.find(ic.original_element_id); if(it==scalars.end()) throw std::runtime_error("missing scalar value for element "+std::to_string(ic.original_element_id)); v=it->second; if(!std::isfinite(v)) throw std::runtime_error("scalar value for element "+std::to_string(ic.original_element_id)+" is nonfinite"); } phys[idx]=v; comp[idx]=(opt.mode=="superlevel")?-v:v; }
+    std::vector<double> finite; for(double v:phys) if(std::isfinite(v)) finite.push_back(v); double pmin=finite.empty()?0:*std::min_element(finite.begin(),finite.end()), pmax=finite.empty()?0:*std::max_element(finite.begin(),finite.end());
+#ifdef CAPTOP_WITH_GUDHI
+    using Base=Gudhi::cubical_complex::Bitmap_cubical_complex_base<double>; using Complex=Gudhi::cubical_complex::Bitmap_cubical_complex<Base>; using Field=Gudhi::persistent_cohomology::Field_Zp; using Pcoh=Gudhi::persistent_cohomology::Persistent_cohomology<Complex,Field>;
+    std::vector<unsigned> gdims={static_cast<unsigned>(vr.nx),static_cast<unsigned>(vr.ny),static_cast<unsigned>(vr.nz)}; Complex cc(gdims,comp,true); Pcoh pcoh(cc); pcoh.init_coefficients(opt.field); pcoh.compute_persistent_cohomology(opt.min_persistence);
+    std::ostringstream diag; pcoh.output_diagram(diag); std::vector<PersistenceInterval> ints; std::string line; while(std::getline(diag,line)){ std::istringstream ls(line); int d; double b,death; if(!(ls>>d>>b)) continue; bool inf=false; if(!(ls>>death)){ death=std::numeric_limits<double>::infinity(); inf=true; } if(std::isinf(death)) inf=true; if(!dim_requested(opt,d)) continue; if(opt.finite_only&&inf) continue; double pers=inf?std::numeric_limits<double>::infinity():death-b; if(pers+1e-14<opt.min_persistence) continue; PersistenceInterval pi; pi.dim=d; pi.bc=b; pi.dc=death; pi.inf=inf; pi.pers=pers; pi.bp=(opt.mode=="superlevel"?-b:b); pi.dp=inf?(opt.mode=="superlevel"?-std::numeric_limits<double>::infinity():std::numeric_limits<double>::infinity()):(opt.mode=="superlevel"?-death:death); ints.push_back(pi); }
+    std::sort(ints.begin(),ints.end(),[](const auto&a,const auto&b){ return std::make_tuple(a.dim,a.bc,a.inf,a.dc)<std::make_tuple(b.dim,b.bc,b.inf,b.dc); });
+    std::filesystem::path od(opt.out_dir); std::filesystem::create_directories(od); std::vector<std::string> names={"persistence_pairs.csv","barcode_summary.csv","betti_curve.csv","captop_persistence_summary.json","captop_persistence_report.txt"}; for(int d:opt.dims) names.push_back("diagram_dim"+std::to_string(d)+".csv"); for(auto&n:names) if(!opt.overwrite&&std::filesystem::exists(od/n)) throw std::runtime_error("output file already exists: "+(od/n).string());
+    { std::ofstream f(od/"persistence_pairs.csv"); f<<"pair_id,dimension,birth_computational,death_computational,birth_physical,death_physical,death_type,persistence_computational,persistence_physical_abs,filtration_policy,mode,coefficient_field\n"; int id=0; for(auto&x:ints) f<<id++<<","<<x.dim<<","<<fnum(x.bc)<<","<<fnum(x.dc)<<","<<fnum(x.bp)<<","<<fnum(x.dp)<<","<<(x.inf?"essential":"finite")<<","<<fnum(x.pers)<<","<<fnum(x.inf?std::numeric_limits<double>::infinity():std::abs(x.dp-x.bp))<<","<<opt.filtration<<","<<opt.mode<<","<<opt.field<<"\n"; }
+    for(int d:opt.dims){ std::ofstream f(od/("diagram_dim"+std::to_string(d)+".csv")); f<<"birth,death,birth_physical,death_physical,death_type,persistence\n"; for(auto&x:ints) if(x.dim==d) f<<fnum(x.bc)<<","<<fnum(x.dc)<<","<<fnum(x.bp)<<","<<fnum(x.dp)<<","<<(x.inf?"essential":"finite")<<","<<fnum(x.pers)<<"\n"; }
+    { std::ofstream f(od/"barcode_summary.csv"); f<<"dimension,intervals_total,intervals_finite,intervals_essential,persistence_min,persistence_q1,persistence_median,persistence_mean,persistence_q3,persistence_max,birth_min,birth_max,death_min,death_max\n"; for(int d:opt.dims){ std::vector<double> ps,bs,ds; long long ess=0; for(auto&x:ints) if(x.dim==d){bs.push_back(x.bc); if(x.inf) ess++; else {ps.push_back(x.pers); ds.push_back(x.dc);}} auto stat=[&](std::vector<double> v,int q){ if(v.empty()) return std::string("NA"); std::sort(v.begin(),v.end()); if(q==0) return fnum(v.front()); if(q==4) return fnum(v.back()); if(q==2) return fnum(v[v.size()/2]); if(q==5) return fnum(std::accumulate(v.begin(),v.end(),0.0)/v.size()); return fnum(v[(v.size()*q)/4]);}; f<<d<<","<<(bs.size())<<","<<ps.size()<<","<<ess<<","<<stat(ps,0)<<","<<stat(ps,1)<<","<<stat(ps,2)<<","<<stat(ps,5)<<","<<stat(ps,3)<<","<<stat(ps,4)<<","<<stat(bs,0)<<","<<stat(bs,4)<<","<<stat(ds,0)<<","<<stat(ds,4)<<"\n"; }}
+    std::vector<double> th; for(double v:comp) if(std::isfinite(v)) th.push_back(v); std::sort(th.begin(),th.end()); th.erase(std::unique(th.begin(),th.end()),th.end()); if(opt.betti_curve_values=="uniform"&&!th.empty()){ double a=th.front(),b=th.back(); th.clear(); for(int i=0;i<opt.betti_curve_samples;i++) th.push_back(a+(b-a)*i/(opt.betti_curve_samples-1)); }
+    { std::ofstream f(od/"betti_curve.csv"); f<<"threshold_computational,threshold_physical,dimension,betti,mode,filtration_policy\n"; for(double t:th) for(int d:opt.dims){ long long beta=0; for(auto&x:ints) if(x.dim==d && x.bc<=t && (x.inf || t<x.dc)) beta++; f<<fnum(t)<<","<<fnum(opt.mode=="superlevel"?-t:t)<<","<<d<<","<<beta<<","<<opt.mode<<","<<opt.filtration<<"\n"; }}
+    long long finite_n=0, ess_n=0; std::map<int,long long> bydim; for(auto&x:ints){ bydim[x.dim]++; if(x.inf) ess_n++; else finite_n++; }
+    { std::ofstream j(od/"captop_persistence_summary.json"); j<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vo.grid_mode)<<"\", \"tolerance\": "<<vo.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_voxels\": "<<total<<", \"occupied_voxels\": "<<vr.indexed_cells.size()<<", \"missing_voxels\": "<<(total-vr.indexed_cells.size())<<", \"occupied_fraction\": "<<(total?double(vr.indexed_cells.size())/total:0)<<", \"origin\": ["<<vr.origin.x<<","<<vr.origin.y<<","<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<","<<vr.spacing.y<<","<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\"},\n  \"gudhi\": {\"compiled\": true, \"used\": true, \"success\": true, \"coefficient_field\": "<<opt.field<<", \"input_top_cells\": "<<total<<", \"missing_value\": \"+inf\"},\n  \"filtration\": {\"policy\": \""<<opt.filtration<<"\", \"mode\": \""<<opt.mode<<"\", \"min_persistence\": "<<opt.min_persistence<<", \"scalar_file\": "; if(opt.scalar_file.empty()) j<<"null"; else j<<"\""<<json_escape(opt.scalar_file)<<"\""; j<<", \"finite_value_count\": "<<finite.size()<<", \"infinite_value_count\": "<<(total-finite.size())<<", \"physical_min\": "<<pmin<<", \"physical_max\": "<<pmax<<", \"computational_min\": "<<(th.empty()?0:th.front())<<", \"computational_max\": "<<(th.empty()?0:th.back())<<"},\n  \"persistence\": {\"requested_dimensions\": ["<<dims_csv(opt.dims)<<"], \"interval_count_total\": "<<ints.size()<<", \"interval_count_finite\": "<<finite_n<<", \"interval_count_essential\": "<<ess_n<<", \"intervals_by_dimension\": {"; bool first=true; for(auto&kv:bydim){ if(!first) j<<","; first=false; j<<"\""<<kv.first<<"\":"<<kv.second;} j<<"}},\n  \"outputs\": {\"persistence_pairs_csv\": \""<<(od/"persistence_pairs.csv").string()<<"\", \"barcode_summary_csv\": \""<<(od/"barcode_summary.csv").string()<<"\", \"betti_curve_csv\": \""<<(od/"betti_curve.csv").string()<<"\"},\n  \"timings\": {\"total_seconds\": "<<std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count()<<"},\n  \"status\": \"SUCCESS\"\n}\n"; }
+    std::ostringstream rep; rep<<"============================================================\nCAPTOP persistent homology report\n============================================================\nSoftware version      : "<<CAPTOP_VERSION<<"\nInput file            : "<<input<<"\nGrid mode             : "<<grid_mode_name(vo.grid_mode)<<"\nTolerance             : "<<vo.tol<<"\nCoefficient field     : Z/"<<opt.field<<"Z\nFiltration policy     : "<<opt.filtration<<"\nFiltration mode       : "<<opt.mode<<"\nMin persistence       : "<<opt.min_persistence<<"\nPrimary topology      : closed occupied cubical complex\nStatus                : VALID AND GUDHI-PERSISTENCE-ANALYZED\n\nTopology engine\n  GUDHI support       : enabled\n  GUDHI used          : yes\n  Result authority    : GUDHI persistent cohomology\n\nGrid\n  Dimensions          : "<<vr.nx<<" x "<<vr.ny<<" x "<<vr.nz<<"\n  Total voxels        : "<<total<<"\n  Occupied voxels     : "<<vr.indexed_cells.size()<<"\n  Missing voxels      : "<<(total-vr.indexed_cells.size())<<"\n  Occupied fraction   : "<<(total?double(vr.indexed_cells.size())/total:0)<<"\n\nFiltration\n  Policy              : "<<opt.filtration<<"\n  Mode                : "<<opt.mode<<"\n"; if(opt.mode=="superlevel") rep<<"  Superlevel handling   : finite scalar values internally negated; reported values restored to original physical scale\n"; rep<<"  Finite cube values  : "<<finite.size()<<"\n  Infinite values     : "<<(total-finite.size())<<"\n  Physical min/max    : "<<pmin<<" / "<<pmax<<"\n\nPersistence intervals\n  Requested dimensions: "<<dims_csv(opt.dims)<<"\n  Total intervals     : "<<ints.size()<<"\n  Finite intervals    : "<<finite_n<<"\n  Essential intervals : "<<ess_n<<"\n"; for(int d:opt.dims) rep<<"  Dim "<<d<<" intervals     : "<<bydim[d]<<"\n"; rep<<"\nOutput files\n  Pairs               : "<<(od/"persistence_pairs.csv").string()<<"\n  Barcode summary     : "<<(od/"barcode_summary.csv").string()<<"\n  Betti curve         : "<<(od/"betti_curve.csv").string()<<"\n  JSON summary        : "<<(od/"captop_persistence_summary.json").string()<<"\n  Report              : "<<(od/"captop_persistence_report.txt").string()<<"\n\nReady for Stage 7 performance engineering: yes\n============================================================\n";
+    { std::ofstream r(od/"captop_persistence_report.txt"); r<<rep.str(); } if(!opt.quiet) std::cout<<rep.str(); return 0;
+#endif
+  }catch(const ParseError& e){ std::cerr<<"parse error: "<<e.what()<<"\n"; return 1; }catch(const ValidationError& e){ std::cerr<<"validation error: "<<e.what()<<"\n"; return 2; }catch(const std::exception& e){ std::cerr<<"persistence error: "<<e.what()<<"\nStatus                : FAILED\n"; return 3; }
+}
 struct BettiOptions { std::string out_dir="captop_betti_out"; bool overwrite=false, force=false, write_diagram=false, write_json=false, write_csv=false, quiet=false, require_gudhi=false, allow_fallback=true, write_contact_audit=false; double max_memory_gb=2.0; int field=2; };
 enum class ContactType { Face, Edge, Vertex };
 static std::string contact_type_name(ContactType t){ if(t==ContactType::Face) return "face"; if(t==ContactType::Edge) return "edge"; return "vertex"; }
@@ -2251,7 +2319,7 @@ struct BettiResult {
   ContactAuditResult contact_audit;
   std::vector<std::string> warnings, errors;
 };
-static bool is_prime_field(int p) {
+static bool is_prime_field_betti(int p) {
   if (p < 2)
     return false;
   for (int d = 2; d * d <= p; ++d)
@@ -3143,7 +3211,7 @@ static int run_betti(int argc, char **argv) {
       return 1;
     }
   }
-  if (!is_prime_field(bo.field)) {
+  if (!is_prime_field_betti(bo.field)) {
     std::cerr << "error: --field must be a prime integer\n";
     return 1;
   }
@@ -3188,6 +3256,10 @@ int main(int argc, char** argv) {
 
     if (command == "betti") {
         return captop::run_betti(argc, argv);
+    }
+
+    if (command == "persist") {
+        return captop::run_persist(argc, argv);
     }
 
     std::cerr << "error: unknown command '" << command << "'\n";
