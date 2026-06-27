@@ -32,12 +32,12 @@ def main(argv):
     data = read_json(summary_path)
     if data.get("status") != expected:
         return fail(f"status {data.get('status')} != {expected}")
-    for name in ["persistence_pairs.csv", "barcode_summary.csv", "captop_persistence_report.txt"]:
+    for name in ["persistence_pairs.csv", "barcode_summary.csv", "betti_curve.csv", "diagram_dim0.csv", "diagram_dim1.csv", "diagram_dim2.csv", "captop_persistence_summary.json", "captop_persistence_report.txt"]:
         if not (out / name).exists():
             return fail(f"missing {name}")
     pairs = read_csv(out / "persistence_pairs.csv")
     for row in pairs:
-        if row.get("death_type") not in {"finite", "essential"}:
+        if row.get("death_type") not in {"finite", "infinite_death", "essential_unpaired"}:
             return fail("invalid death_type")
         if int(row.get("coefficient_field", "0")) < 2:
             return fail("invalid coefficient field in pairs")

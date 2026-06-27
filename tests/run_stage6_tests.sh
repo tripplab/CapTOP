@@ -9,4 +9,5 @@ if ! "$BIN" --version | grep -q 'GUDHI support: enabled'; then
   exit 0
 fi
 
-echo "Stage 6 test harness is ready. Add/refresh synthetic meshes in $WORK and run captop persist cases."
+"$ROOT/tests/stage6_interval_completeness/run.sh"
+echo "Stage 6 interval completeness tests passed."
