@@ -1705,6 +1705,31 @@ static void print_convert_options(std::ostream& os) {
     os << "  --max-memory-gb <value>  Dense-grid memory limit before --force is required [default: 4]\n";
 }
 
+static void print_persist_options(std::ostream& os) {
+    os << "Persist options:\n";
+    os << "  --homology-dim <dims>    Comma-separated dimensions from 0,1,2,3 [default: 0,1,2]\n";
+    os << "  --field <prime>          Coefficient field [default: 2]\n";
+    os << "  --filtration <policy>    Filtration policy: occupancy, material, or scalar-file [default: occupancy]\n";
+    os << "  --scalar-file <csv>      CSV containing element_id,value columns for scalar-file filtration\n";
+    os << "  --mode <mode>            Filtration mode: sublevel or superlevel [default: sublevel]\n";
+    os << "  --min-persistence <eps>  Minimum persistence threshold [default: 0]\n";
+    os << "  --out <dir>              Output directory [default: captop_persist_out]\n";
+    os << "  --overwrite              Replace existing persistence output files\n";
+    os << "  --force                  Continue when the dense memory estimate exceeds --max-memory-gb\n";
+    os << "  --max-memory-gb <value>  Dense-grid memory limit before --force is required [default: 4]\n";
+    os << "  --write-pairs            Write persistence_pairs.csv output\n";
+    os << "  --write-diagrams         Write per-dimension diagram CSV outputs\n";
+    os << "  --write-betti-curve      Write betti_curve.csv output\n";
+    os << "  --write-barcode-summary  Write barcode_summary.csv output\n";
+    os << "  --write-json             Write JSON summary output\n";
+    os << "  --write-all              Enable all persistence output writers\n";
+    os << "  --betti-curve-samples <N>  Number of uniform Betti-curve samples [default: 200]\n";
+    os << "  --betti-curve-values <mode>  Betti-curve values: unique or uniform [default: unique]\n";
+    os << "  --finite-only            Exclude essential intervals from persistence outputs\n";
+    os << "  --include-essential      Include essential intervals in persistence outputs [default]\n";
+    os << "  --quiet                  Suppress terminal report\n";
+}
+
 static void print_validate_usage(std::ostream& os) {
     os << "Usage:\n";
     os << "  captop validate <input-mesh> [options]\n\n";
@@ -1731,6 +1756,8 @@ static void print_convert_usage(std::ostream& os) {
     os << "  --write-csv              Write CSV summary (included by default)\n";
     os << "  --quiet                  Suppress terminal report\n";
     os << "  -h, --help               Show this help message\n";
+    os << "\n";
+    print_persist_options(os);
 }
 
 static void print_usage(std::ostream& os) {
@@ -1759,6 +1786,8 @@ static void print_usage(std::ostream& os) {
     os << "  --write-csv              Write CSV summary (included by default)\n";
     os << "  --quiet                  Suppress terminal report\n";
     os << "  -h, --help               Show this help message\n";
+    os << "\n";
+    print_persist_options(os);
 }
 
 
@@ -2218,7 +2247,7 @@ static std::string fnum(double v){ if(std::isinf(v)) return v>0?"inf":"-inf"; st
 static std::vector<int> parse_dims(const std::string& s){ std::vector<int> r; std::stringstream ss(s); std::string t; while(std::getline(ss,t,',')){ long long d; if(!parse_long_long(trim(t),d)) throw std::runtime_error("invalid homology dimension '"+t+"'"); if(d<0) throw std::runtime_error("homology dimensions must be nonnegative"); if(d>3) throw std::runtime_error("unsupported homology dimension "+std::to_string(d)+" for 3D cubical grid"); r.push_back((int)d);} if(r.empty()) throw std::runtime_error("--homology-dim cannot be empty"); std::sort(r.begin(),r.end()); r.erase(std::unique(r.begin(),r.end()),r.end()); return r; }
 static bool dim_requested(const PersistOptions& o,int d){ return std::find(o.dims.begin(),o.dims.end(),d)!=o.dims.end(); }
 static std::string dims_csv(const std::vector<int>& d){ std::ostringstream o; for(size_t i=0;i<d.size();++i){ if(i)o<<","; o<<d[i]; } return o.str(); }
-static void print_persist_usage(std::ostream& os){ os<<"Usage:\n  captop persist <input-mesh> [options]\n\nStage 6 persistent homology using GUDHI bitmap cubical complexes.\n\nOptions:\n  --homology-dim <0,1,2,3> [default: 0,1,2]\n  --field <prime> [default: 2]\n  --filtration occupancy|material|scalar-file [file]\n  --scalar-file <csv>\n  --mode sublevel|superlevel [default: sublevel]\n  --min-persistence <epsilon> [default: 0]\n  --out <dir> [default: captop_persist_out]\n  --overwrite --force --quiet --max-memory-gb <gb>\n  --write-pairs --write-diagrams --write-betti-curve --write-barcode-summary --write-json --write-all\n  --betti-curve-samples <N> --betti-curve-values unique|uniform\n  --finite-only --include-essential\n"; print_validation_options(os); }
+static void print_persist_usage(std::ostream& os){ os<<"Usage:\n  captop persist <input-mesh> [options]\n\nStage 6 persistent homology using GUDHI bitmap cubical complexes.\n\n"; print_validation_options(os); os<<"\n"; print_persist_options(os); os<<"  -h, --help               Show this help message\n"; }
 
 static int run_persist(int argc,char** argv){
   if(argc<3){ print_persist_usage(std::cerr); return 1; }
