@@ -615,3 +615,103 @@ Missing cubes are always encoded as `+inf`; CAPTOP does not use finite sentinels
 Default Stage 6 output includes `persistence_pairs.csv`, `barcode_summary.csv`, per-dimension diagram files for dimensions `0,1,2`, `betti_curve.csv`, `captop_persistence_summary.json`, and `captop_persistence_report.txt`. Homology dimensions can be restricted with `--homology-dim`, and coefficient fields are selected with `--field p`, where `p` must be prime.
 
 For occupancy persistence, the Betti numbers derived from persistence intervals at threshold `0` are intended to match the Stage 5 GUDHI Betti numbers, providing a regression bridge from binary topology to full cubical persistence.
+
+## Stage 7 SDT filtration
+
+Stage 7 adds a signed distance transform (SDT) filtration to both `convert` and
+`persist`. Occupancy alone is single-scale: every occupied cube enters the
+filtration at `0.0`, so persistent homology has no finite lifetimes and
+diagram-to-diagram distances (bottleneck, Wasserstein) are degenerate. The SDT
+replaces that single slice with a real filtration whose value at each cell is the
+Euclidean distance to the occupied/empty interface, so sublevel sets sweep an
+eroding-then-dilating solid and produce meaningful birth/death pairs.
+
+```
+captop convert mesh.msh --filtration sdt --out out_sdt
+captop convert mesh.msh --filtration sdt --sdt-signed --out out_sdt_signed
+captop persist mesh.msh --filtration sdt --sdt-signed --sdt-square --write-all --out out_persist_sdt
+```
+
+### Conventions
+
+- Distances are **negative inside** the occupied solid and **positive in the
+  void**, with magnitude equal to the physical Euclidean distance (Angstrom)
+  between cube centers to the nearest occupied/empty boundary.
+- The **default** SDT is **unsigned (outward, `>= 0`)**: occupied cubes are clamped
+  to `0` and the field grows into the void. The sublevel set `{ sdt <= 0 }` is then
+  exactly the occupied set, so the Stage 5 occupancy Betti numbers are the natural
+  cross-check for any downstream SDT-at-zero reader.
+- `--sdt-signed` adds the inward (negative) branch: occupied cubes take the
+  negative distance to the nearest empty cube, capturing the full erosion-to-
+  dilation sweep.
+- `--sdt-square` reports `sign(d) * d^2` in Angstrom^2 (the `alpha = r^2` axis used
+  by atom-based weighted-alpha analysis), with the square applied to `|d|` and the
+  sign reattached so the value stays monotone across zero and the filtration
+  remains valid.
+
+### Requirements
+
+- `--sdt-signed` and `--sdt-square` require `--filtration sdt`.
+- SDT requires a uniform cubic grid (`--grid strict-cube`, satisfied by single-
+  element-size OctreeMesh exports). A non-cubic grid is rejected.
+- SDT requires at least one occupied and one empty cell in the validated bounding
+  box (a fully solid grid has no interface) and is otherwise rejected with an
+  explanatory message.
+- In `persist`, SDT forces `--mode sublevel`; the SDT itself encodes direction via
+  `--sdt-signed`, so a `superlevel` sign flip would double-invert and is rejected.
+
+### Algorithm and validation
+
+The transform is the separable exact Euclidean distance transform of Felzenszwalb
+and Huttenlocher (2012): three linear-time axis passes compose to the exact
+squared Euclidean distance, scaled to Angstrom by the uniform spacing. A
+standalone harness (`sdt_test.cpp` with `sdt_core.inc`) checks the result against
+analytic fixtures — a solid block (face distance 1, corner distance sqrt(3),
+signed interior depth -1) and a hollow shell (enclosed cavity at the expected
+outward depth, and staying positive under the signed convention because it is
+void rather than solid).
+
+### Metadata
+
+When SDT is used, `convert`'s `captop_grid_metadata.json` records the convention
+under `filtration.sdt` (sign, square, units, spacing, and a `convention` string);
+the field is `null` for non-SDT filtrations. The `persist` report and summary JSON
+gain an SDT convention line, and threshold-zero accounting (intervals alive at
+zero, the consistency cross-check) is active for SDT exactly as for occupancy.
+
+## Stage 8 diagram interop
+
+Stage 8 makes `persist` a clean diagram producer for downstream metric analysis
+(for example a Python `cubic_fold_compare.py` that computes bottleneck and
+Wasserstein distances and renders figures). CapTOP remains the single GUDHI
+authority for the cubical complex and the persistence diagram; the metric layer
+and figures live in the consumer.
+
+In addition to the per-dimension `diagram_dimN.csv` files it already writes,
+`persist` now emits `captop_diagram_manifest.json`, a machine-readable contract
+describing:
+
+- the grid (`nx`, `ny`, `nz`, `spacing_h`, `origin`),
+- the filtration policy, mode, **units**, and the SDT sign/square convention,
+- a `comparability_key` (policy | units | mode | sdt sign/square) so a consumer can
+  refuse to compare diagrams that do not share a metric axis (for example an
+  Angstrom diagram against an Angstrom^2 one),
+- the diagram CSV column schema and notes, and
+- per-dimension entries listing each `diagram_dimN.csv`, its Betti number at
+  threshold 0, and interval counts.
+
+A consumer should read the manifest first, then load the listed diagram files and
+compare in the physical columns (`birth_physical`, `death_physical`), which carry
+the chosen units. Infinite deaths appear as the string `inf` in the CSV.
+
+The default `persist` output set is therefore:
+
+```
+captop_persistence_summary.json
+captop_persistence_report.txt
+captop_diagram_manifest.json      (Stage 8)
+persistence_pairs.csv
+barcode_summary.csv
+betti_curve.csv
+diagram_dim0.csv, diagram_dim1.csv, diagram_dim2.csv   (one per requested dimension)
+```
