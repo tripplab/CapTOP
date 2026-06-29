@@ -11,6 +11,17 @@
 //   ./captop validate mesh.msh --tol 1e-8
 //   ./captop validate mesh.msh --cube-rel-tol 0.02
 //   ./captop validate mesh.msh --ignore-non-hexa
+//
+// Stage 7 (signed distance transform filtration):
+//   ./captop convert mesh.msh --filtration sdt --out out_sdt
+//   ./captop convert mesh.msh --filtration sdt --sdt-signed --out out_sdt_signed
+//   ./captop persist mesh.msh --filtration sdt --sdt-signed --sdt-square --write-all --out out_persist_sdt
+//
+// Stage 8 (diagram interop for downstream Python: cubic_fold_compare.py):
+//   persist always writes per-dimension diagram_dimN.csv and a machine-readable
+//   captop_diagram_manifest.json describing units, sign/square convention, the
+//   grid spacing h, and the per-dimension diagram file list, so a Python consumer
+//   can self-configure with no hard-coded assumptions.
 
 #include <algorithm>
 #include <array>
@@ -43,7 +54,7 @@
 
 namespace captop {
 
-static const char* CAPTOP_VERSION = "0.1.0-stage6";
+static const char* CAPTOP_VERSION = "0.1.0-stage7";
 
 enum class GridMode {
     StrictCube,
@@ -1694,7 +1705,9 @@ static void print_validation_options(std::ostream& os) {
 static void print_convert_options(std::ostream& os) {
     os << "Convert options:\n";
     os << "  --out <dir>              Output directory [default: captop_out]\n";
-    os << "  --filtration <policy>    Filtration policy: occupancy, material, scalar-file, or binary-threshold [default: occupancy]\n";
+    os << "  --filtration <policy>    Filtration policy: occupancy, material, scalar-file, binary-threshold, or sdt [default: occupancy]\n";
+    os << "  --sdt-signed             SDT: add the inward (negative-inside) branch; default SDT is unsigned outward (>=0)\n";
+    os << "  --sdt-square             SDT: report sign(d)*d^2 in Angstrom^2 (the alpha=r^2 axis) instead of d in Angstrom\n";
     os << "  --selected-material <N>  For material filtration, include only the selected material as finite\n";
     os << "  --scalar-file <csv>      CSV containing element_id,value columns for scalar-file or binary-threshold filtration\n";
     os << "  --threshold <value>      Threshold value required by binary-threshold filtration\n";
@@ -1709,7 +1722,9 @@ static void print_persist_options(std::ostream& os) {
     os << "Persist options:\n";
     os << "  --homology-dim <dims>    Comma-separated dimensions from 0,1,2,3 [default: 0,1,2]\n";
     os << "  --field <prime>          Coefficient field [default: 2]\n";
-    os << "  --filtration <policy>    Filtration policy: occupancy, material, or scalar-file [default: occupancy]\n";
+    os << "  --filtration <policy>    Filtration policy: occupancy, material, scalar-file, or sdt [default: occupancy]\n";
+    os << "  --sdt-signed             SDT: add the inward (negative-inside) branch; default SDT is unsigned outward (>=0)\n";
+    os << "  --sdt-square             SDT: report sign(d)*d^2 in Angstrom^2 (the alpha=r^2 axis) instead of d in Angstrom\n";
     os << "  --scalar-file <csv>      CSV containing element_id,value columns for scalar-file filtration\n";
     os << "  --mode <mode>            Filtration mode: sublevel or superlevel [default: sublevel]\n";
     os << "  --min-persistence <eps>  Minimum persistence threshold [default: 0]\n";
@@ -2102,6 +2117,15 @@ static int run_validate(int argc, char** argv) {
 }
 
 
+// Stage 7: signed distance transform (SDT) filtration options. Defined here so
+// both ConvertOptions and PersistOptions can hold it; the EDT implementation and
+// build_sdt_field() live just below linear_index() (after this point).
+struct SdtOptions {
+    bool enabled = false;   // --filtration sdt
+    bool signed_  = false;  // --sdt-signed : add the inward (negative) branch
+    bool square  = false;   // --sdt-square : report sign(d)*d^2 (Angstrom^2)
+};
+
 struct GridCell {
     bool occupied = false;
     double cube_value = std::numeric_limits<double>::infinity();
@@ -2122,12 +2146,225 @@ struct ConvertOptions {
     bool force = false;
     bool overwrite = false;
     double max_memory_gb = 4.0;
+    SdtOptions sdt;            // Stage 7: signed distance transform filtration
 };
 
 struct ConvertCounts { std::size_t occupied=0, missing=0, finite=0, selected=0; };
 
 static std::size_t linear_index(long long i,long long j,long long k,long long nx,long long ny){
     return static_cast<std::size_t>(i + nx * (j + ny * k));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7: signed distance transform (SDT) filtration
+// ---------------------------------------------------------------------------
+//
+// Goal: turn a single-scale occupancy bitmap into a genuine filtration so that
+// downstream persistence has real, multi-scale lifetimes (the occupancy
+// filtration alone is degenerate: every occupied cell enters at 0, so all
+// finite lifetimes vanish and bottleneck/Wasserstein collapse to numerics).
+//
+// Convention (fixed by design discussion):
+//   * NEGATIVE INSIDE the occupied solid, POSITIVE in the void, magnitude =
+//     Euclidean distance (in PHYSICAL units, Angstrom) to the nearest
+//     occupied/empty interface, measured between voxel CENTERS.
+//   * The zero level set therefore separates occupied from empty: the sublevel
+//     set { sdt <= 0 } is exactly the occupied set. This makes CapTOP's own
+//     occupancy Betti (betti command) the natural cross-check oracle for any
+//     Python SDT@0 reader -- they must agree.
+//   * DEFAULT is UNSIGNED (outward only): occupied cells are clamped to 0 and the
+//     field grows into the void. Births stay at 0, the diagram reads as "how the
+//     solid inflates", and { sdt <= 0 } is still exactly the occupied set.
+//   * --sdt-signed adds the INWARD negative branch (erosion): occupied cells take
+//     -(distance to the nearest empty cell), so the full erosion->dilation sweep
+//     is captured.
+//   * --sdt-square reports sign(d) * d^2 (apply the square to |d|, reattach the
+//     sign). This is monotonic across the whole real line, so the filtration
+//     stays valid, and on the unsigned (d >= 0) branch it is exactly d^2 -- the
+//     alpha = r^2 coordinate used by the weighted-alpha pipeline, enabling
+//     side-by-side comparison of the two representations on a shared axis.
+//
+// The domain is the validated bounding box (nx x ny x nz). Missing interior
+// cells (occupied = 0 inside the box) count as void; for a closed capsid shell
+// the enclosed cavity is therefore at large positive distance from the shell,
+// which is the intended behavior for cavity detection.
+//
+// Algorithm: separable exact Euclidean distance transform of Felzenszwalb &
+// Huttenlocher (2012), "Distance Transforms of Sampled Functions". Each 1D pass
+// computes the lower envelope of upward parabolas in O(n); three axis passes
+// give the exact squared Euclidean distance in O(nx*ny*nz). Distances are
+// computed in VOXEL units on the sample lattice (which is exact only when
+// spacing is uniform -- guaranteed here by the strict-cube grid mode and the
+// OctreeMesh single-element-size export) and then scaled to physical Angstrom by
+// the uniform spacing h.
+
+// One pass of the exact 1D squared-distance transform along a single line.
+// f is the input cost (0 at a seed, +inf elsewhere); d receives the squared
+// distance to the nearest seed on this line, or +inf if the line has no seed.
+//
+// Implementation note: rather than special-case +inf samples inside the lower-
+// envelope sweep (which is where an earlier version risked an uninitialized
+// intersection and an index underflow), we first COMPACT the finite seeds of
+// this line into a position list, then for every query index take the minimum
+// of (q - seed)^2 over those seeds. Seeds are the cells with cost 0 (occupied,
+// or empty for the inward pass); on a line there are typically O(1) contiguous
+// runs of them, so this is effectively linear for the bitmap case and is exact
+// and branch-simple. The full 3D transform is still the standard separable
+// Felzenszwalb-Huttenlocher composition (squared distances add across axes),
+// which this 1D primitive feeds correctly because after the first axis the cost
+// f is itself a squared distance, not just 0/inf -- see edt_1d_general below for
+// that case. This 0/inf primitive is used only for the FIRST axis pass.
+static void edt_1d_seed(const std::vector<double>& f, std::vector<double>& d, int n){
+    const double INF = std::numeric_limits<double>::infinity();
+    bool any = false;
+    for (int i = 0; i < n; ++i) if (f[i] == 0.0) { any = true; break; }
+    if (!any) { for (int i = 0; i < n; ++i) d[i] = INF; return; }
+    const long long BIG = (long long)n + 1;   // larger than any in-line distance
+    std::vector<long long> dist(n, BIG);
+    // Forward sweep: distance to nearest seed at or to the left.
+    long long last = -1;
+    for (int i = 0; i < n; ++i) {
+        if (f[i] == 0.0) last = i;
+        if (last >= 0) dist[i] = i - last;
+    }
+    // Backward sweep: take the min with the nearest seed at or to the right.
+    last = -1;
+    for (int i = n - 1; i >= 0; --i) {
+        if (f[i] == 0.0) last = i;
+        if (last >= 0) dist[i] = std::min(dist[i], (long long)(last - i));
+    }
+    for (int i = 0; i < n; ++i) d[i] = double(dist[i] * dist[i]);   // squared
+}
+
+// General 1D squared-distance transform (lower envelope of parabolas) for an
+// arbitrary nonnegative cost f (used for the 2nd and 3rd axis passes, where f is
+// already a squared distance from earlier axes). Exact O(n); +inf entries are
+// handled by simply never being chosen as envelope minima (their parabolas sit
+// at +inf). Felzenszwalb & Huttenlocher (2012), Fig. 1.
+static void edt_1d_general(const std::vector<double>& f, std::vector<double>& d, int n){
+    const double INF = std::numeric_limits<double>::infinity();
+    // Find first finite sample to seed the envelope; if none, the line is all inf.
+    int first = -1;
+    for (int i = 0; i < n; ++i) if (std::isfinite(f[i])) { first = i; break; }
+    if (first < 0) { for (int i = 0; i < n; ++i) d[i] = INF; return; }
+    std::vector<int> v(n);            // envelope parabola locations
+    std::vector<double> z(n + 1);     // envelope breakpoints
+    int k = 0;
+    v[0] = first; z[0] = -INF; z[1] = INF;
+    for (int q = first + 1; q < n; ++q) {
+        if (!std::isfinite(f[q])) continue;
+        double s;
+        while (true) {
+            int p = v[k];
+            s = ((f[q] + double(q) * q) - (f[p] + double(p) * p)) / (2.0 * q - 2.0 * p);
+            if (s <= z[k] && k > 0) { --k; }
+            else break;
+        }
+        ++k; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[k + 1] < q) ++k;
+        int p = v[k];
+        d[q] = double(q - p) * (q - p) + f[p];
+    }
+}
+
+// Full 3D exact squared-EDT over the bounding box. seed[idx] == true marks a
+// seed (distance 0); the result sq[idx] is the squared Euclidean distance (in
+// squared VOXEL units) from cell idx to the nearest seed. Cells with no seed in
+// the whole grid receive +inf.
+static std::vector<double> edt_squared_3d(const std::vector<uint8_t>& seed,
+                                          long long nx, long long ny, long long nz){
+    const double INF = std::numeric_limits<double>::infinity();
+    size_t total = size_t(nx) * size_t(ny) * size_t(nz);
+    std::vector<double> g(total);
+    for (size_t i = 0; i < total; ++i) g[i] = seed[i] ? 0.0 : INF;
+
+    // Pass along x (i varies fastest in linear_index = i + nx*(j + ny*k)).
+    // First axis: cost is 0/inf, so use the seed primitive.
+    {
+        std::vector<double> f(nx), d(nx);
+        for (long long k = 0; k < nz; ++k)
+            for (long long j = 0; j < ny; ++j) {
+                for (long long i = 0; i < nx; ++i) f[i] = g[linear_index(i, j, k, nx, ny)];
+                edt_1d_seed(f, d, (int)nx);
+                for (long long i = 0; i < nx; ++i) g[linear_index(i, j, k, nx, ny)] = d[i];
+            }
+    }
+    // Pass along y. Cost is now a squared distance -> general envelope primitive.
+    {
+        std::vector<double> f(ny), d(ny);
+        for (long long k = 0; k < nz; ++k)
+            for (long long i = 0; i < nx; ++i) {
+                for (long long j = 0; j < ny; ++j) f[j] = g[linear_index(i, j, k, nx, ny)];
+                edt_1d_general(f, d, (int)ny);
+                for (long long j = 0; j < ny; ++j) g[linear_index(i, j, k, nx, ny)] = d[j];
+            }
+    }
+    // Pass along z. General envelope primitive.
+    {
+        std::vector<double> f(nz), d(nz);
+        for (long long j = 0; j < ny; ++j)
+            for (long long i = 0; i < nx; ++i) {
+                for (long long k = 0; k < nz; ++k) f[k] = g[linear_index(i, j, k, nx, ny)];
+                edt_1d_general(f, d, (int)nz);
+                for (long long k = 0; k < nz; ++k) g[linear_index(i, j, k, nx, ny)] = d[k];
+            }
+    }
+    return g;
+}
+
+// Build the physical signed-distance filtration value array over the bounding
+// box, following the convention above. occ[idx] == 1 for occupied cells. h is
+// the uniform physical spacing (Angstrom). Returns one finite value per cell
+// (the SDT is finite everywhere as long as at least one occupied AND one empty
+// cell exist; pure-solid or pure-empty grids are rejected by the caller).
+//
+//   unsigned (default): value = +dist_to_nearest_occupied        (>= 0)
+//                       occupied cells -> 0
+//   signed  (--signed): occupied cells -> -dist_to_nearest_empty (< 0 inside)
+//                       empty cells    -> +dist_to_nearest_occupied
+//   square  (--square): value = sign(value) * value^2  (applied last)
+//
+// All distances are physical: (voxel distance) * h.
+static std::vector<double> build_sdt_field(const std::vector<uint8_t>& occ,
+                                           long long nx, long long ny, long long nz,
+                                           double h, const SdtOptions& s){
+    size_t total = size_t(nx) * size_t(ny) * size_t(nz);
+    // Outward distance: seeds = occupied cells -> distance from every cell to the
+    // nearest occupied cell. Occupied cells get 0.
+    std::vector<double> out_sq = edt_squared_3d(occ, nx, ny, nz);
+    std::vector<double> field(total, 0.0);
+    if (!s.signed_) {
+        for (size_t i = 0; i < total; ++i) {
+            double d = std::sqrt(out_sq[i]) * h;           // >= 0; 0 on the solid
+            field[i] = d;
+        }
+    } else {
+        // Inward distance: seeds = EMPTY cells -> distance from every cell to the
+        // nearest empty cell. Occupied cells get their depth inside the solid.
+        std::vector<uint8_t> empty(total);
+        for (size_t i = 0; i < total; ++i) empty[i] = occ[i] ? 0 : 1;
+        std::vector<double> in_sq = edt_squared_3d(empty, nx, ny, nz);
+        for (size_t i = 0; i < total; ++i) {
+            if (occ[i]) field[i] = -std::sqrt(in_sq[i]) * h;   // negative inside
+            else        field[i] =  std::sqrt(out_sq[i]) * h;  // positive outside
+        }
+    }
+    if (s.square) {
+        for (size_t i = 0; i < total; ++i) {
+            double v = field[i];
+            field[i] = (v < 0.0 ? -1.0 : 1.0) * v * v;         // sign(v) * v^2
+        }
+    }
+    return field;
+}
+
+static std::string sdt_convention_string(const SdtOptions& s){
+    std::string sgn = s.signed_ ? "signed(negative-inside)" : "unsigned(outward,>=0)";
+    std::string sq  = s.square  ? "sign(d)*d^2(Angstrom^2)" : "d(Angstrom)";
+    return sgn + ";" + sq;
 }
 
 static std::string json_escape(const std::string& v){
@@ -2190,6 +2427,8 @@ static int run_convert(int argc,char** argv){
         else if(a=="--max-errors"){ long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vopts.max_errors=n; }
         else if(a=="--out") copts.out_dir=need(a);
         else if(a=="--filtration") copts.filtration=need(a);
+        else if(a=="--sdt-signed") copts.sdt.signed_=true;
+        else if(a=="--sdt-square") copts.sdt.square=true;
         else if(a=="--scalar-file") copts.scalar_file=need(a);
         else if(a=="--threshold"){ if(!parse_double(need(a),copts.threshold)) throw std::runtime_error("invalid --threshold"); copts.has_threshold=true; }
         else if(a=="--threshold-op") copts.threshold_op=need(a);
@@ -2204,23 +2443,40 @@ static int run_convert(int argc,char** argv){
         if(copts.has_selected_material && copts.filtration!="material") throw std::runtime_error("--selected-material is only compatible with --filtration material");
         if((copts.filtration=="scalar-file"||copts.filtration=="binary-threshold") && copts.scalar_file.empty()) throw std::runtime_error("--filtration "+copts.filtration+" requires --scalar-file");
         if(copts.filtration=="binary-threshold" && !copts.has_threshold) throw std::runtime_error("--filtration binary-threshold requires --threshold");
-        if(copts.filtration!="occupancy"&&copts.filtration!="material"&&copts.filtration!="scalar-file"&&copts.filtration!="binary-threshold") throw std::runtime_error("unknown filtration policy '"+copts.filtration+"'");
+        if((copts.sdt.signed_||copts.sdt.square) && copts.filtration!="sdt") throw std::runtime_error("--sdt-signed/--sdt-square require --filtration sdt");
+        copts.sdt.enabled = (copts.filtration=="sdt");
+        if(copts.filtration!="occupancy"&&copts.filtration!="material"&&copts.filtration!="scalar-file"&&copts.filtration!="binary-threshold"&&copts.filtration!="sdt") throw std::runtime_error("unknown filtration policy '"+copts.filtration+"'");
         Mesh mesh=parse_mesh_file(input,popts); ValidationResult vr=validate_mesh(mesh,vopts); if(!vr.valid){ print_validation_report(input,vopts,vr); return 2; }
         if(vr.nx<=0||vr.ny<=0||vr.nz<=0) throw std::runtime_error("grid dimensions must be positive");
         size_t sx=vr.nx, sy=vr.ny, sz=vr.nz; if(sx>std::numeric_limits<size_t>::max()/sy || sx*sy>std::numeric_limits<size_t>::max()/sz) throw std::runtime_error("integer overflow in nx * ny * nz");
         size_t total=sx*sy*sz, bytes=total*sizeof(GridCell); double limit=copts.max_memory_gb*1024.0*1024.0*1024.0; if(bytes>limit&&!copts.force) throw std::runtime_error("dense memory estimate exceeds --max-memory-gb; use --force to override");
         std::vector<GridCell> cells(total); std::unordered_map<long long,double> scalars; if(copts.filtration=="scalar-file"||copts.filtration=="binary-threshold") scalars=read_scalar_file(copts.scalar_file);
         for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); auto& g=cells.at(idx); if(g.occupied) throw std::runtime_error("duplicate occupied grid cell "+cell_key_string(CellIndex{ic.i,ic.j,ic.k})); g.occupied=true; g.original_element_id=ic.original_element_id; g.has_material=ic.has_material; g.material=ic.has_material?ic.material:0; double val=0.0;
-            if(copts.filtration=="occupancy") val=0.0; else if(copts.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" has no material/layer id, but --filtration material requires material values for all occupied cells"); val=copts.has_selected_material ? (ic.material==copts.selected_material?0.0:std::numeric_limits<double>::infinity()) : static_cast<double>(ic.material); }
+            if(copts.sdt.enabled) val=0.0; /* placeholder; overwritten by SDT field below */ else if(copts.filtration=="occupancy") val=0.0; else if(copts.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" has no material/layer id, but --filtration material requires material values for all occupied cells"); val=copts.has_selected_material ? (ic.material==copts.selected_material?0.0:std::numeric_limits<double>::infinity()) : static_cast<double>(ic.material); }
             else { auto it=scalars.find(ic.original_element_id); if(it==scalars.end()) throw std::runtime_error("missing scalar value for element "+std::to_string(ic.original_element_id)); val=(copts.filtration=="scalar-file")?it->second:(threshold_pass(it->second,copts.threshold,copts.threshold_op,vopts.tol)?0.0:std::numeric_limits<double>::infinity()); }
             g.cube_value=val; }
+        if(copts.sdt.enabled){
+            // Stage 7: overwrite cube_value for EVERY cell in the bounding box with
+            // the signed distance transform value. SDT needs uniform spacing and
+            // both phases present (a pure-solid or pure-empty grid has no interface).
+            double hx=vr.spacing.x, hy=vr.spacing.y, hz=vr.spacing.z;
+            if(!(hx>0.0)) throw std::runtime_error("SDT requires positive uniform spacing");
+            if(std::abs(hx-hy)>1e-9*std::max(1.0,hx) || std::abs(hx-hz)>1e-9*std::max(1.0,hx))
+                throw std::runtime_error("SDT requires uniform (cubic) spacing; got ("+std::to_string(hx)+","+std::to_string(hy)+","+std::to_string(hz)+"). Re-export with one element size or use --grid strict-cube.");
+            std::vector<uint8_t> occ_sdt(total,0); size_t n_occ=0;
+            for(size_t i=0;i<total;++i){ occ_sdt[i]=cells[i].occupied?1:0; if(cells[i].occupied) n_occ++; }
+            if(n_occ==0) throw std::runtime_error("SDT filtration requires at least one occupied cell");
+            if(n_occ==total) throw std::runtime_error("SDT filtration requires at least one empty cell in the bounding box (grid is fully solid; no interface)");
+            std::vector<double> sdt=build_sdt_field(occ_sdt,vr.nx,vr.ny,vr.nz,hx,copts.sdt);
+            for(size_t i=0;i<total;++i) cells[i].cube_value=sdt[i];
+        }
         ConvertCounts cnt; std::vector<double> values(total); std::vector<uint8_t> occ(total); std::vector<int64_t> mat(total), eid(total);
         for(size_t i=0;i<total;++i){ const auto& g=cells[i]; values[i]=g.cube_value; occ[i]=g.occupied?1:0; mat[i]=g.occupied?(g.has_material?g.material:0):-1; eid[i]=g.occupied?g.original_element_id:-1; if(g.occupied) cnt.occupied++; else cnt.missing++; if(std::isfinite(g.cube_value)) cnt.finite++; }
         cnt.selected=cnt.finite; if(cnt.occupied!=mesh.hexes.size()) throw std::runtime_error("occupied_cubes does not match parsed hexahedra");
         std::filesystem::path outdir(copts.out_dir); std::filesystem::create_directories(outdir); if(!std::filesystem::is_directory(outdir)) throw std::runtime_error("output directory cannot be created");
         std::vector<std::string> names={"captop_grid_metadata.json","captop_cube_values_f64.raw","captop_occupied_u8.raw","captop_material_i64.raw","captop_element_id_i64.raw","captop_conversion_report.txt"}; for(auto& n:names) if(!copts.overwrite && std::filesystem::exists(outdir/n)) throw std::runtime_error("output file already exists: "+(outdir/n).string());
         write_raw(outdir/"captop_cube_values_f64.raw",values); write_raw(outdir/"captop_occupied_u8.raw",occ); write_raw(outdir/"captop_material_i64.raw",mat); write_raw(outdir/"captop_element_id_i64.raw",eid);
-        { std::ofstream js(outdir/"captop_grid_metadata.json"); js<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vopts.grid_mode)<<"\", \"tolerance\": "<<vopts.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_cells\": "<<total<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<", "<<vr.spacing.y<<", "<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\", \"axis_order\": [\"x\", \"y\", \"z\"]}"; if(vopts.grid_mode==GridMode::Rectilinear){ js<<",\n  \"axes\": {\"x\": "; write_axis_json(js,vr.x_axis); js<<", \"y\": "; write_axis_json(js,vr.y_axis); js<<", \"z\": "; write_axis_json(js,vr.z_axis); js<<"}";} js<<",\n  \"counts\": {\"nodes\": "<<vr.n_nodes<<", \"hexahedra\": "<<vr.n_hexes<<", \"occupied_cubes\": "<<cnt.occupied<<", \"missing_cubes\": "<<cnt.missing<<", \"finite_value_cubes\": "<<cnt.finite<<", \"selected_cubes\": "<<cnt.selected<<"},\n  \"filtration\": {\"policy\": \""<<copts.filtration<<"\", \"missing_value\": \"+inf\", \"scalar_file\": "; if(copts.scalar_file.empty()) js<<"null"; else js<<"\""<<json_escape(copts.scalar_file)<<"\""; js<<", \"threshold\": "; if(copts.has_threshold) js<<copts.threshold; else js<<"null"; js<<", \"threshold_op\": "; if(copts.filtration=="binary-threshold") js<<"\""<<copts.threshold_op<<"\""; else js<<"null"; js<<", \"selected_material\": "; if(copts.has_selected_material) js<<copts.selected_material; else js<<"null"; js<<"},\n  \"raw_files\": {\"cube_values_f64\": {\"path\": \"captop_cube_values_f64.raw\", \"type\": \"float64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"occupied_u8\": {\"path\": \"captop_occupied_u8.raw\", \"type\": \"uint8\", \"count\": "<<total<<"}, \"material_i64\": {\"path\": \"captop_material_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"element_id_i64\": {\"path\": \"captop_element_id_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}}\n}\n"; if(!js) throw std::runtime_error("cannot write metadata"); }
+        { std::ofstream js(outdir/"captop_grid_metadata.json"); js<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vopts.grid_mode)<<"\", \"tolerance\": "<<vopts.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_cells\": "<<total<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<", "<<vr.spacing.y<<", "<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\", \"axis_order\": [\"x\", \"y\", \"z\"]}"; if(vopts.grid_mode==GridMode::Rectilinear){ js<<",\n  \"axes\": {\"x\": "; write_axis_json(js,vr.x_axis); js<<", \"y\": "; write_axis_json(js,vr.y_axis); js<<", \"z\": "; write_axis_json(js,vr.z_axis); js<<"}";} js<<",\n  \"counts\": {\"nodes\": "<<vr.n_nodes<<", \"hexahedra\": "<<vr.n_hexes<<", \"occupied_cubes\": "<<cnt.occupied<<", \"missing_cubes\": "<<cnt.missing<<", \"finite_value_cubes\": "<<cnt.finite<<", \"selected_cubes\": "<<cnt.selected<<"},\n  \"filtration\": {\"policy\": \""<<copts.filtration<<"\", \"missing_value\": \"+inf\", \"scalar_file\": "; if(copts.scalar_file.empty()) js<<"null"; else js<<"\""<<json_escape(copts.scalar_file)<<"\""; js<<", \"threshold\": "; if(copts.has_threshold) js<<copts.threshold; else js<<"null"; js<<", \"threshold_op\": "; if(copts.filtration=="binary-threshold") js<<"\""<<copts.threshold_op<<"\""; else js<<"null"; js<<", \"selected_material\": "; if(copts.has_selected_material) js<<copts.selected_material; else js<<"null"; js<<", \"sdt\": "; if(copts.sdt.enabled){ js<<"{\"enabled\": true, \"signed\": "<<(copts.sdt.signed_?"true":"false")<<", \"square\": "<<(copts.sdt.square?"true":"false")<<", \"sign_convention\": \"negative_inside\", \"zero_level_is_occupied_set\": "<<(copts.sdt.signed_?"false":"true")<<", \"units\": \""<<(copts.sdt.square?"Angstrom^2":"Angstrom")<<"\", \"spacing_h\": "<<vr.spacing.x<<", \"convention\": \""<<sdt_convention_string(copts.sdt)<<"\"}"; } else js<<"null"; js<<"},\n  \"raw_files\": {\"cube_values_f64\": {\"path\": \"captop_cube_values_f64.raw\", \"type\": \"float64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"occupied_u8\": {\"path\": \"captop_occupied_u8.raw\", \"type\": \"uint8\", \"count\": "<<total<<"}, \"material_i64\": {\"path\": \"captop_material_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"element_id_i64\": {\"path\": \"captop_element_id_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}}\n}\n"; if(!js) throw std::runtime_error("cannot write metadata"); }
         std::string rep=conversion_report(input,copts.out_dir,vopts,copts,vr,cnt,bytes); { std::ofstream rr(outdir/"captop_conversion_report.txt"); rr<<rep; if(!rr) throw std::runtime_error("cannot write conversion report"); } std::cout<<rep; return 0;
     } catch(const ParseError& e){ std::cerr<<"parse error: "<<e.what()<<"\n"; return 1; } catch(const std::exception& e){ std::cerr<<"conversion error: "<<e.what()<<"\n"; return 3; }
 }
@@ -2241,6 +2497,7 @@ struct PersistOptions {
   std::vector<int> dims{0,1,2};
   int field=2, betti_curve_samples=200; double min_persistence=0, max_memory_gb=4.0;
   bool overwrite=false, force=false, quiet=false, write_pairs=false, write_diagrams=false, write_betti_curve=false, write_barcode_summary=false, write_json=false, write_all=false, finite_only=false, include_essential=true;
+  SdtOptions sdt;            // Stage 7: signed distance transform filtration
 };
 struct PersistenceInterval { int dim=0; double bc=0, dc=0, bp=0, dp=0, pers=0; std::string death_type="finite"; bool inf=false; bool alive_at_zero=false; };
 static bool interval_alive_at(double b,double d,bool inf,double t){ return b<=t && (inf || t<d); }
@@ -2263,6 +2520,7 @@ static int run_persist(int argc,char** argv){
       else if(a=="--ignore-non-hexa") po.ignore_non_hexa=true; else if(a=="--max-errors"){ long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vo.max_errors=n; }
       else if(a=="--homology-dim") opt.dims=parse_dims(need(a)); else if(a=="--field"){ long long f; if(!parse_long_long(need(a),f)||f>INT32_MAX) throw std::runtime_error("invalid --field"); opt.field=(int)f; }
       else if(a=="--filtration"){ opt.filtration=need(a); if(opt.filtration=="scalar-file" && i+1<argc && std::string(argv[i+1]).rfind("--",0)!=0) opt.scalar_file=argv[++i]; }
+      else if(a=="--sdt-signed") opt.sdt.signed_=true; else if(a=="--sdt-square") opt.sdt.square=true;
       else if(a=="--scalar-file") opt.scalar_file=need(a); else if(a=="--mode") opt.mode=to_lower(need(a)); else if(a=="--min-persistence"){ if(!parse_double(need(a),opt.min_persistence)||opt.min_persistence<0) throw std::runtime_error("invalid minimum persistence"); }
       else if(a=="--out") opt.out_dir=need(a); else if(a=="--overwrite") opt.overwrite=true; else if(a=="--force") opt.force=true; else if(a=="--quiet") opt.quiet=true; else if(a=="--max-memory-gb"){ if(!parse_double(need(a),opt.max_memory_gb)||opt.max_memory_gb<=0) throw std::runtime_error("invalid --max-memory-gb"); }
       else if(a=="--write-pairs") opt.write_pairs=true; else if(a=="--write-diagrams") opt.write_diagrams=true; else if(a=="--write-betti-curve") opt.write_betti_curve=true; else if(a=="--write-barcode-summary") opt.write_barcode_summary=true; else if(a=="--write-json") opt.write_json=true; else if(a=="--write-all") opt.write_all=true; else if(a=="--finite-only"){ opt.finite_only=true; opt.include_essential=false; } else if(a=="--include-essential") opt.include_essential=true; else if(a=="--essential-death") (void)need(a);
@@ -2271,13 +2529,34 @@ static int run_persist(int argc,char** argv){
   if(!is_prime_field(opt.field)){ std::cerr<<"error: coefficient field must be prime (got "<<opt.field<<")\n"; return 1; }
   if(opt.mode!="sublevel"&&opt.mode!="superlevel"){ std::cerr<<"error: --mode must be sublevel or superlevel\n"; return 1; }
   if(opt.filtration=="scalar-file"&&opt.scalar_file.empty()){ std::cerr<<"error: --filtration scalar-file requires --scalar-file or inline CSV path\n"; return 3; }
-  if(opt.filtration!="occupancy"&&opt.filtration!="material"&&opt.filtration!="scalar-file"){ std::cerr<<"error: unsupported filtration policy '"<<opt.filtration<<"'\n"; return 1; }
+  if((opt.sdt.signed_||opt.sdt.square)&&opt.filtration!="sdt"){ std::cerr<<"error: --sdt-signed/--sdt-square require --filtration sdt\n"; return 1; }
+  opt.sdt.enabled=(opt.filtration=="sdt");
+  if(opt.sdt.enabled&&opt.mode!="sublevel"){ std::cerr<<"error: --filtration sdt uses its own sign convention; only --mode sublevel is valid (the SDT itself encodes direction via --sdt-signed)\n"; return 1; }
+  if(opt.filtration!="occupancy"&&opt.filtration!="material"&&opt.filtration!="scalar-file"&&opt.filtration!="sdt"){ std::cerr<<"error: unsupported filtration policy '"<<opt.filtration<<"'\n"; return 1; }
   try{
     auto t0=std::chrono::steady_clock::now(); Mesh mesh=parse_mesh_file(input,po); ValidationResult vr=validate_mesh(mesh,vo); if(!vr.valid){ print_validation_report(input,vo,vr); return 2; }
     size_t total=(size_t)vr.nx*(size_t)vr.ny*(size_t)vr.nz; if(total*sizeof(double)>opt.max_memory_gb*1024.0*1024*1024&&!opt.force) throw std::runtime_error("dense grid memory estimate exceeds --max-memory-gb; use --force to override");
     std::vector<double> phys(total,std::numeric_limits<double>::infinity()), comp(total,std::numeric_limits<double>::infinity()); std::unordered_map<long long,double> scalars; if(opt.filtration=="scalar-file") scalars=read_scalar_file(opt.scalar_file);
+    if(opt.sdt.enabled){
+      // Stage 7: signed distance transform over the whole bounding box.
+      double hx=vr.spacing.x, hy=vr.spacing.y, hz=vr.spacing.z;
+      if(!(hx>0.0)) throw std::runtime_error("SDT requires positive uniform spacing");
+      if(std::abs(hx-hy)>1e-9*std::max(1.0,hx) || std::abs(hx-hz)>1e-9*std::max(1.0,hx))
+        throw std::runtime_error("SDT requires uniform (cubic) spacing; got ("+std::to_string(hx)+","+std::to_string(hy)+","+std::to_string(hz)+"). Re-export with one element size or use --grid strict-cube.");
+      std::vector<uint8_t> occ_sdt(total,0); size_t n_occ=0;
+      for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); occ_sdt[idx]=1; n_occ++; }
+      if(n_occ==0) throw std::runtime_error("SDT filtration requires at least one occupied cell");
+      if(n_occ==total) throw std::runtime_error("SDT filtration requires at least one empty cell in the bounding box (grid is fully solid; no interface)");
+      std::vector<double> sdt=build_sdt_field(occ_sdt,vr.nx,vr.ny,vr.nz,hx,opt.sdt);
+      for(size_t i=0;i<total;++i){ phys[i]=sdt[i]; comp[i]=sdt[i]; }   // mode forced sublevel for SDT
+    } else
     for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); double v=0; if(opt.filtration=="occupancy") v=0; else if(opt.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" lacks material value"); v=(double)ic.material; } else { auto it=scalars.find(ic.original_element_id); if(it==scalars.end()) throw std::runtime_error("missing scalar value for element "+std::to_string(ic.original_element_id)); v=it->second; if(!std::isfinite(v)) throw std::runtime_error("scalar value for element "+std::to_string(ic.original_element_id)+" is nonfinite"); } phys[idx]=v; comp[idx]=(opt.mode=="superlevel")?-v:v; }
     std::vector<double> finite; for(double v:phys) if(std::isfinite(v)) finite.push_back(v); double pmin=finite.empty()?0:*std::min_element(finite.begin(),finite.end()), pmax=finite.empty()?0:*std::max_element(finite.begin(),finite.end());
+    // Threshold 0 is the meaningful slice for both occupancy and SDT: for SDT the
+    // zero level set is the occupied/empty interface, so { f <= 0 } is exactly the
+    // occupied set (unsigned) or the eroded-to-interface solid (signed). Keep the
+    // alive-at-zero accounting and the consistency block for SDT too.
+    bool zero_meaningful = (opt.filtration=="occupancy") || opt.sdt.enabled;
 #ifdef CAPTOP_WITH_GUDHI
     using Base=Gudhi::cubical_complex::Bitmap_cubical_complex_base<double>; using Complex=Gudhi::cubical_complex::Bitmap_cubical_complex<Base>; using Field=Gudhi::persistent_cohomology::Field_Zp; using Pcoh=Gudhi::persistent_cohomology::Persistent_cohomology<Complex,Field>;
     std::vector<unsigned> gdims={static_cast<unsigned>(vr.nx),static_cast<unsigned>(vr.ny),static_cast<unsigned>(vr.nz)}; Complex cc(gdims,comp,true); Pcoh pcoh(cc); pcoh.init_coefficients(opt.field); pcoh.compute_persistent_cohomology(opt.min_persistence);
@@ -2292,16 +2571,59 @@ static int run_persist(int argc,char** argv){
     for(int d=0; d<=3; ++d){ if(dim_requested(opt,d) && interval_beta0[d]!=gudhi_beta0[d]) throw std::runtime_error("interval-derived Betti numbers do not match GUDHI persistent Betti query at threshold 0"); }
     long long euler0=gudhi_beta0[0]-gudhi_beta0[1]+gudhi_beta0[2]-gudhi_beta0[3];
     std::sort(ints.begin(),ints.end(),[](const auto&a,const auto&b){ return std::make_tuple(a.dim,a.bc,a.inf,a.dc)<std::make_tuple(b.dim,b.bc,b.inf,b.dc); });
-    std::filesystem::path od(opt.out_dir); std::filesystem::create_directories(od); std::vector<std::string> names={"persistence_pairs.csv","barcode_summary.csv","betti_curve.csv","captop_persistence_summary.json","captop_persistence_report.txt"}; for(int d:opt.dims) names.push_back("diagram_dim"+std::to_string(d)+".csv"); for(auto&n:names) if(!opt.overwrite&&std::filesystem::exists(od/n)) throw std::runtime_error("output file already exists: "+(od/n).string());
+    std::filesystem::path od(opt.out_dir); std::filesystem::create_directories(od); std::vector<std::string> names={"persistence_pairs.csv","barcode_summary.csv","betti_curve.csv","captop_persistence_summary.json","captop_persistence_report.txt","captop_diagram_manifest.json"}; for(int d:opt.dims) names.push_back("diagram_dim"+std::to_string(d)+".csv"); for(auto&n:names) if(!opt.overwrite&&std::filesystem::exists(od/n)) throw std::runtime_error("output file already exists: "+(od/n).string());
     auto include_dim=[&](int d){ return dim_requested(opt,d); };
     { std::ofstream f(od/"persistence_pairs.csv"); f<<"pair_id,dimension,birth_computational,death_computational,birth_physical,death_physical,death_type,persistence_computational,persistence_physical_abs,alive_at_zero,filtration_policy,mode,coefficient_field\n"; int id=0; for(auto&x:ints) if(include_dim(x.dim)) f<<id++<<","<<x.dim<<","<<fnum(x.bc)<<","<<fnum(x.dc)<<","<<fnum(x.bp)<<","<<fnum(x.dp)<<","<<x.death_type<<","<<fnum(x.pers)<<","<<fnum(x.inf?std::numeric_limits<double>::infinity():std::abs(x.dp-x.bp))<<","<<(x.alive_at_zero?"true":"false")<<","<<opt.filtration<<","<<opt.mode<<","<<opt.field<<"\n"; if(!f) throw std::runtime_error("cannot write persistence_pairs.csv"); }
     for(int d:opt.dims){ std::ofstream f(od/("diagram_dim"+std::to_string(d)+".csv")); f<<"birth,death,birth_physical,death_physical,death_type,persistence,alive_at_zero\n"; for(auto&x:ints) if(x.dim==d) f<<fnum(x.bc)<<","<<fnum(x.dc)<<","<<fnum(x.bp)<<","<<fnum(x.dp)<<","<<x.death_type<<","<<fnum(x.pers)<<","<<(x.alive_at_zero?"true":"false")<<"\n"; if(!f) throw std::runtime_error("cannot write diagram_dim"+std::to_string(d)+".csv"); }
+    /* Stage 8: machine-readable diagram manifest. This is the producer/consumer
+       contract for the downstream Python metric layer (cubic_fold_compare.py).
+       It declares, per requested dimension, the diagram CSV file and its column
+       schema, plus the unit/sign/square convention and the grid spacing h, so a
+       Python reader can self-configure (which column is the metric axis, what its
+       units are, whether the two diagrams it is comparing share an axis) with no
+       hard-coded assumptions. A consumer should compare diagrams in the PHYSICAL
+       columns (birth_physical, death_physical); the *_physical columns already
+       carry the chosen units (Angstrom, or Angstrom^2 when sdt-square). Two diagrams
+       are metric-comparable iff their {filtration_policy, units, mode} agree (and,
+       for sdt, their signed/square flags). */
+    { std::ofstream f(od/"captop_diagram_manifest.json"); f<<std::setprecision(17);
+      bool sdt_on=opt.sdt.enabled;
+      std::string units = sdt_on ? (opt.sdt.square?"Angstrom^2":"Angstrom")
+                                 : (opt.filtration=="occupancy"?"occupancy_level":"filtration_value");
+      std::string metric_axis = "physical";   // compare in *_physical columns
+      f<<"{\n";
+      f<<"  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n";
+      f<<"  \"schema\": {\"format\": \"captop_diagram_manifest\", \"version\": 1},\n";
+      f<<"  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n";
+      f<<"  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz
+       <<", \"spacing_h\": "<<vr.spacing.x<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"]},\n";
+      f<<"  \"filtration\": {\"policy\": \""<<opt.filtration<<"\", \"mode\": \""<<opt.mode<<"\", \"units\": \""<<units<<"\", "
+       <<"\"metric_axis\": \""<<metric_axis<<"\", \"min_persistence\": "<<opt.min_persistence
+       <<", \"coefficient_field\": "<<opt.field<<", \"zero_threshold_meaningful\": "<<(zero_meaningful?"true":"false")<<", ";
+      if(sdt_on) f<<"\"sdt\": {\"enabled\": true, \"signed\": "<<(opt.sdt.signed_?"true":"false")
+                  <<", \"square\": "<<(opt.sdt.square?"true":"false")
+                  <<", \"sign_convention\": \"negative_inside\", \"convention\": \""<<sdt_convention_string(opt.sdt)<<"\"}";
+      else f<<"\"sdt\": null";
+      f<<"},\n";
+      // Comparability key: two diagrams are bottleneck/Wasserstein-comparable iff
+      // these fields match. Python can hash this to refuse meaningless comparisons.
+      f<<"  \"comparability_key\": \""<<opt.filtration<<"|"<<units<<"|"<<opt.mode
+       <<"|"<<(sdt_on?(std::string(opt.sdt.signed_?"signed":"unsigned")+(opt.sdt.square?"-sq":"-lin")):std::string("na"))<<"\",\n";
+      f<<"  \"diagram_columns\": [\"birth\", \"death\", \"birth_physical\", \"death_physical\", \"death_type\", \"persistence\", \"alive_at_zero\"],\n";
+      f<<"  \"diagram_column_notes\": {\"birth\": \"computational filtration value\", \"birth_physical\": \"physical value in 'units' (USE THIS for metric distance)\", \"death_type\": \"finite | infinite_death | essential_unpaired\", \"alive_at_zero\": \"feature present at threshold 0 (the occupied/interface slice)\", \"infinite_death\": \"death encoded as 'inf' string in CSV\"},\n";
+      f<<"  \"dimensions\": [";
+      { bool first=true; for(int d:opt.dims){ if(!first) f<<", "; first=false;
+          long long nfin=0,ninf=0,ness=0,nal=0; for(auto&x:ints) if(x.dim==d){ if(x.death_type=="finite")nfin++; else if(x.death_type=="infinite_death")ninf++; else ness++; if(x.alive_at_zero)nal++; }
+          f<<"{\"dim\": "<<d<<", \"file\": \"diagram_dim"<<d<<".csv\", \"betti_at_zero\": "<<interval_beta0[d]
+           <<", \"finite_intervals\": "<<nfin<<", \"infinite_death_intervals\": "<<ninf<<", \"essential_unpaired_intervals\": "<<ness<<", \"intervals_alive_at_zero\": "<<nal<<"}"; } }
+      f<<"]\n}\n";
+      if(!f) throw std::runtime_error("cannot write captop_diagram_manifest.json"); }
     { std::ofstream f(od/"barcode_summary.csv"); f<<"dimension,intervals_total,finite_death_intervals,infinite_death_intervals,essential_unpaired_intervals,intervals_alive_at_zero,persistence_min,persistence_q1,persistence_median,persistence_mean,persistence_q3,persistence_max,birth_min,birth_max,finite_death_min,finite_death_max\n"; for(int d:opt.dims){ std::vector<double> ps,bs,ds; long long infd=0,essu=0,alive=0,totald=0; for(auto&x:ints) if(x.dim==d){ totald++; bs.push_back(x.bc); if(x.alive_at_zero) alive++; if(x.death_type=="finite"){ps.push_back(x.pers); ds.push_back(x.dc);} else if(x.death_type=="infinite_death") infd++; else essu++; } auto stat=[&](std::vector<double> v,int q){ if(v.empty()) return std::string("NA"); std::sort(v.begin(),v.end()); if(q==0) return fnum(v.front()); if(q==4) return fnum(v.back()); if(q==2) return fnum(v[v.size()/2]); if(q==5) return fnum(std::accumulate(v.begin(),v.end(),0.0)/v.size()); return fnum(v[(v.size()*q)/4]);}; f<<d<<","<<totald<<","<<ps.size()<<","<<infd<<","<<essu<<","<<alive<<","<<stat(ps,0)<<","<<stat(ps,1)<<","<<stat(ps,2)<<","<<stat(ps,5)<<","<<stat(ps,3)<<","<<stat(ps,4)<<","<<stat(bs,0)<<","<<stat(bs,4)<<","<<stat(ds,0)<<","<<stat(ds,4)<<"\n"; } if(!f) throw std::runtime_error("cannot write barcode_summary.csv"); }
-    std::vector<double> th; for(double v:comp) if(std::isfinite(v)) th.push_back(v); if(opt.filtration=="occupancy") th.push_back(0.0); std::sort(th.begin(),th.end()); th.erase(std::unique(th.begin(),th.end()),th.end()); if(opt.betti_curve_values=="uniform"&&!th.empty()){ double a=th.front(),b=th.back(); th.clear(); for(int i=0;i<opt.betti_curve_samples;i++) th.push_back(a+(b-a)*i/(opt.betti_curve_samples-1)); if(opt.filtration=="occupancy") th.push_back(0.0); std::sort(th.begin(),th.end()); th.erase(std::unique(th.begin(),th.end()),th.end()); }
+    std::vector<double> th; for(double v:comp) if(std::isfinite(v)) th.push_back(v); if(zero_meaningful) th.push_back(0.0); std::sort(th.begin(),th.end()); th.erase(std::unique(th.begin(),th.end()),th.end()); if(opt.betti_curve_values=="uniform"&&!th.empty()){ double a=th.front(),b=th.back(); th.clear(); for(int i=0;i<opt.betti_curve_samples;i++) th.push_back(a+(b-a)*i/(opt.betti_curve_samples-1)); if(zero_meaningful) th.push_back(0.0); std::sort(th.begin(),th.end()); th.erase(std::unique(th.begin(),th.end()),th.end()); }
     { std::ofstream f(od/"betti_curve.csv"); f<<"threshold_computational,threshold_physical,dimension,betti,mode,filtration_policy\n"; for(double t:th) for(int d:opt.dims){ long long beta=0; for(auto&x:ints) if(x.dim==d && interval_alive_at(x.bc,x.dc,x.inf,t)) beta++; f<<fnum(t)<<","<<fnum(opt.mode=="superlevel"?-t:t)<<","<<d<<","<<beta<<","<<opt.mode<<","<<opt.filtration<<"\n"; } if(!f) throw std::runtime_error("cannot write betti_curve.csv"); }
     long long finite_n=0, infdeath_n=0, ess_n=0, alive_n=0; std::map<int,long long> bydim, bydim_fin, bydim_inf, bydim_ess, bydim_alive; for(auto&x:ints) if(include_dim(x.dim)){ bydim[x.dim]++; if(x.alive_at_zero){ alive_n++; bydim_alive[x.dim]++; } if(x.death_type=="finite"){ finite_n++; bydim_fin[x.dim]++; } else if(x.death_type=="infinite_death"){ infdeath_n++; bydim_inf[x.dim]++; } else { ess_n++; bydim_ess[x.dim]++; } }
-    { std::ofstream j(od/"captop_persistence_summary.json"); j<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vo.grid_mode)<<"\", \"tolerance\": "<<vo.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_voxels\": "<<total<<", \"occupied_voxels\": "<<vr.indexed_cells.size()<<", \"missing_voxels\": "<<(total-vr.indexed_cells.size())<<", \"occupied_fraction\": "<<(total?double(vr.indexed_cells.size())/total:0)<<"},\n  \"gudhi\": {\"compiled\": true, \"used\": true, \"success\": true, \"coefficient_field\": "<<opt.field<<", \"input_top_cells\": "<<total<<", \"missing_value\": \"+inf\"},\n  \"filtration\": {\"policy\": \""<<opt.filtration<<"\", \"mode\": \""<<opt.mode<<"\", \"min_persistence\": "<<opt.min_persistence<<", \"finite_value_count\": "<<finite.size()<<", \"infinite_value_count\": "<<(total-finite.size())<<", \"physical_min\": "<<pmin<<", \"physical_max\": "<<pmax<<", \"computational_min\": "<<(th.empty()?0:th.front())<<", \"computational_max\": "<<(th.empty()?0:th.back())<<"},\n  \"persistence\": {\"requested_dimensions\": ["<<dims_csv(opt.dims)<<"], \"interval_count_total\": "<<ints.size()<<", \"finite_death_interval_count\": "<<finite_n<<", \"infinite_death_interval_count\": "<<infdeath_n<<", \"essential_unpaired_interval_count\": "<<ess_n<<", \"intervals_alive_at_zero_by_dimension\": {\"0\": "<<interval_beta0[0]<<", \"1\": "<<interval_beta0[1]<<", \"2\": "<<interval_beta0[2]<<", \"3\": "<<interval_beta0[3]<<"}},\n  \"threshold_checks\": {\"occupancy_threshold_zero\": {\"enabled\": "<<(opt.filtration=="occupancy"?"true":"false")<<", \"threshold\": 0.0, \"beta_from_gudhi_query\": {\"0\": "<<gudhi_beta0[0]<<", \"1\": "<<gudhi_beta0[1]<<", \"2\": "<<gudhi_beta0[2]<<", \"3\": "<<gudhi_beta0[3]<<"}, \"beta_from_intervals\": {\"0\": "<<interval_beta0[0]<<", \"1\": "<<interval_beta0[1]<<", \"2\": "<<interval_beta0[2]<<", \"3\": "<<interval_beta0[3]<<"}, \"euler_chi\": "<<euler0<<", \"matches_stage5\": true, \"status\": \"PASS\"}},\n  \"outputs\": {\"persistence_pairs_csv\": \""<<(od/"persistence_pairs.csv").string()<<"\", \"barcode_summary_csv\": \""<<(od/"barcode_summary.csv").string()<<"\", \"betti_curve_csv\": \""<<(od/"betti_curve.csv").string()<<"\""; for(int d:opt.dims) j<<", \"diagram_dim"<<d<<"_csv\": \""<<(od/("diagram_dim"+std::to_string(d)+".csv")).string()<<"\""; j<<", \"json_summary\": \""<<(od/"captop_persistence_summary.json").string()<<"\", \"report\": \""<<(od/"captop_persistence_report.txt").string()<<"\"},\n  \"timings\": {\"total_seconds\": "<<std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count()<<"},\n  \"status\": \"SUCCESS\"\n}\n"; if(!j) throw std::runtime_error("cannot write captop_persistence_summary.json"); }
-    std::ostringstream rep; rep<<"============================================================\nCAPTOP persistent homology report\n============================================================\nSoftware version      : "<<CAPTOP_VERSION<<"\nInput file            : "<<input<<"\nGrid mode             : "<<grid_mode_name(vo.grid_mode)<<"\nTolerance             : "<<vo.tol<<"\nCoefficient field     : Z/"<<opt.field<<"Z\nFiltration policy     : "<<opt.filtration<<"\nFiltration mode       : "<<opt.mode<<"\nMin persistence       : "<<opt.min_persistence<<"\nPrimary topology      : closed occupied cubical complex\nStatus                : VALID AND GUDHI-PERSISTENCE-ANALYZED\n\nTopology engine\n  GUDHI support       : enabled\n  GUDHI used          : yes\n  Result authority    : GUDHI persistent cohomology\n\nGrid\n  Dimensions          : "<<vr.nx<<" x "<<vr.ny<<" x "<<vr.nz<<"\n  Total voxels        : "<<total<<"\n  Occupied voxels     : "<<vr.indexed_cells.size()<<"\n  Missing voxels      : "<<(total-vr.indexed_cells.size())<<"\n  Occupied fraction   : "<<(total?double(vr.indexed_cells.size())/total:0)<<"\n\nFiltration\n  Policy              : "<<opt.filtration<<"\n  Mode                : "<<opt.mode<<"\n  Finite cube values  : "<<finite.size()<<"\n  Infinite values     : "<<(total-finite.size())<<"\n  Physical min/max    : "<<pmin<<" / "<<pmax<<"\n  Computational min/max: "<<(th.empty()?0:th.front())<<" / "<<(th.empty()?0:th.back())<<"\n\nPersistence intervals\n  Requested dimensions: "<<dims_csv(opt.dims)<<"\n  Total intervals     : "<<ints.size()<<"\n  Finite-death intervals      : "<<finite_n<<"\n  Infinite-death intervals    : "<<infdeath_n<<"\n  Essential-unpaired intervals: "<<ess_n<<"\n  Intervals alive at threshold 0: "<<alive_n<<"\n"; for(int d:opt.dims) rep<<"  Dim "<<d<<" total intervals          : "<<bydim[d]<<"\n  Dim "<<d<<" finite-death intervals   : "<<bydim_fin[d]<<"\n  Dim "<<d<<" infinite-death intervals : "<<bydim_inf[d]<<"\n  Dim "<<d<<" essential-unpaired intervals: "<<bydim_ess[d]<<"\n  Dim "<<d<<" alive at threshold 0  : "<<bydim_alive[d]<<"\n"; if(opt.filtration=="occupancy") rep<<"\nOccupancy threshold consistency\n  beta0(0) from GUDHI query   : "<<gudhi_beta0[0]<<"\n  beta0(0) from intervals     : "<<interval_beta0[0]<<"\n  beta1(0) from GUDHI query   : "<<gudhi_beta0[1]<<"\n  beta1(0) from intervals     : "<<interval_beta0[1]<<"\n  beta2(0) from GUDHI query   : "<<gudhi_beta0[2]<<"\n  beta2(0) from intervals     : "<<interval_beta0[2]<<"\n  beta3(0) from GUDHI query   : "<<gudhi_beta0[3]<<"\n  beta3(0) from intervals     : "<<interval_beta0[3]<<"\n  Euler chi at threshold 0    : "<<euler0<<"\n  Stage 5 consistency check   : PASS\n"; rep<<"\nOutput files\n  Pairs               : "<<(od/"persistence_pairs.csv").string()<<"\n  Barcode summary     : "<<(od/"barcode_summary.csv").string()<<"\n  Betti curve         : "<<(od/"betti_curve.csv").string()<<"\n"; for(int d:opt.dims) rep<<"  Diagram dim "<<d<<"       : "<<(od/("diagram_dim"+std::to_string(d)+".csv")).string()<<"\n"; rep<<"  JSON summary        : "<<(od/"captop_persistence_summary.json").string()<<"\n  Report              : "<<(od/"captop_persistence_report.txt").string()<<"\n\nReady for Stage 7 performance engineering: yes\n============================================================\n";
+    { std::ofstream j(od/"captop_persistence_summary.json"); j<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vo.grid_mode)<<"\", \"tolerance\": "<<vo.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_voxels\": "<<total<<", \"occupied_voxels\": "<<vr.indexed_cells.size()<<", \"missing_voxels\": "<<(total-vr.indexed_cells.size())<<", \"occupied_fraction\": "<<(total?double(vr.indexed_cells.size())/total:0)<<"},\n  \"gudhi\": {\"compiled\": true, \"used\": true, \"success\": true, \"coefficient_field\": "<<opt.field<<", \"input_top_cells\": "<<total<<", \"missing_value\": \"+inf\"},\n  \"filtration\": {\"policy\": \""<<opt.filtration<<"\", \"mode\": \""<<opt.mode<<"\", \"min_persistence\": "<<opt.min_persistence<<", \"finite_value_count\": "<<finite.size()<<", \"infinite_value_count\": "<<(total-finite.size())<<", \"physical_min\": "<<pmin<<", \"physical_max\": "<<pmax<<", \"computational_min\": "<<(th.empty()?0:th.front())<<", \"computational_max\": "<<(th.empty()?0:th.back())<<"},\n  \"persistence\": {\"requested_dimensions\": ["<<dims_csv(opt.dims)<<"], \"interval_count_total\": "<<ints.size()<<", \"finite_death_interval_count\": "<<finite_n<<", \"infinite_death_interval_count\": "<<infdeath_n<<", \"essential_unpaired_interval_count\": "<<ess_n<<", \"intervals_alive_at_zero_by_dimension\": {\"0\": "<<interval_beta0[0]<<", \"1\": "<<interval_beta0[1]<<", \"2\": "<<interval_beta0[2]<<", \"3\": "<<interval_beta0[3]<<"}},\n  \"threshold_checks\": {\"occupancy_threshold_zero\": {\"enabled\": "<<(zero_meaningful?"true":"false")<<", \"threshold\": 0.0, \"beta_from_gudhi_query\": {\"0\": "<<gudhi_beta0[0]<<", \"1\": "<<gudhi_beta0[1]<<", \"2\": "<<gudhi_beta0[2]<<", \"3\": "<<gudhi_beta0[3]<<"}, \"beta_from_intervals\": {\"0\": "<<interval_beta0[0]<<", \"1\": "<<interval_beta0[1]<<", \"2\": "<<interval_beta0[2]<<", \"3\": "<<interval_beta0[3]<<"}, \"euler_chi\": "<<euler0<<", \"matches_stage5\": true, \"status\": \"PASS\"}},\n  \"outputs\": {\"persistence_pairs_csv\": \""<<(od/"persistence_pairs.csv").string()<<"\", \"barcode_summary_csv\": \""<<(od/"barcode_summary.csv").string()<<"\", \"betti_curve_csv\": \""<<(od/"betti_curve.csv").string()<<"\""; for(int d:opt.dims) j<<", \"diagram_dim"<<d<<"_csv\": \""<<(od/("diagram_dim"+std::to_string(d)+".csv")).string()<<"\""; j<<", \"json_summary\": \""<<(od/"captop_persistence_summary.json").string()<<"\", \"diagram_manifest\": \""<<(od/"captop_diagram_manifest.json").string()<<"\", \"report\": \""<<(od/"captop_persistence_report.txt").string()<<"\"},\n  \"timings\": {\"total_seconds\": "<<std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count()<<"},\n  \"status\": \"SUCCESS\"\n}\n"; if(!j) throw std::runtime_error("cannot write captop_persistence_summary.json"); }
+    std::ostringstream rep; rep<<"============================================================\nCAPTOP persistent homology report\n============================================================\nSoftware version      : "<<CAPTOP_VERSION<<"\nInput file            : "<<input<<"\nGrid mode             : "<<grid_mode_name(vo.grid_mode)<<"\nTolerance             : "<<vo.tol<<"\nCoefficient field     : Z/"<<opt.field<<"Z\nFiltration policy     : "<<opt.filtration<<"\nFiltration mode       : "<<opt.mode<<"\nMin persistence       : "<<opt.min_persistence<<"\nPrimary topology      : closed occupied cubical complex\nStatus                : VALID AND GUDHI-PERSISTENCE-ANALYZED\n\nTopology engine\n  GUDHI support       : enabled\n  GUDHI used          : yes\n  Result authority    : GUDHI persistent cohomology\n\nGrid\n  Dimensions          : "<<vr.nx<<" x "<<vr.ny<<" x "<<vr.nz<<"\n  Total voxels        : "<<total<<"\n  Occupied voxels     : "<<vr.indexed_cells.size()<<"\n  Missing voxels      : "<<(total-vr.indexed_cells.size())<<"\n  Occupied fraction   : "<<(total?double(vr.indexed_cells.size())/total:0)<<"\n\nFiltration\n  Policy              : "<<opt.filtration<<"\n  Mode                : "<<opt.mode<<(opt.sdt.enabled?("\n  SDT convention      : "+sdt_convention_string(opt.sdt)):std::string())<<"\n  Finite cube values  : "<<finite.size()<<"\n  Infinite values     : "<<(total-finite.size())<<"\n  Physical min/max    : "<<pmin<<" / "<<pmax<<"\n  Computational min/max: "<<(th.empty()?0:th.front())<<" / "<<(th.empty()?0:th.back())<<"\n\nPersistence intervals\n  Requested dimensions: "<<dims_csv(opt.dims)<<"\n  Total intervals     : "<<ints.size()<<"\n  Finite-death intervals      : "<<finite_n<<"\n  Infinite-death intervals    : "<<infdeath_n<<"\n  Essential-unpaired intervals: "<<ess_n<<"\n  Intervals alive at threshold 0: "<<alive_n<<"\n"; for(int d:opt.dims) rep<<"  Dim "<<d<<" total intervals          : "<<bydim[d]<<"\n  Dim "<<d<<" finite-death intervals   : "<<bydim_fin[d]<<"\n  Dim "<<d<<" infinite-death intervals : "<<bydim_inf[d]<<"\n  Dim "<<d<<" essential-unpaired intervals: "<<bydim_ess[d]<<"\n  Dim "<<d<<" alive at threshold 0  : "<<bydim_alive[d]<<"\n"; if(zero_meaningful) rep<<"\nOccupancy threshold consistency\n  beta0(0) from GUDHI query   : "<<gudhi_beta0[0]<<"\n  beta0(0) from intervals     : "<<interval_beta0[0]<<"\n  beta1(0) from GUDHI query   : "<<gudhi_beta0[1]<<"\n  beta1(0) from intervals     : "<<interval_beta0[1]<<"\n  beta2(0) from GUDHI query   : "<<gudhi_beta0[2]<<"\n  beta2(0) from intervals     : "<<interval_beta0[2]<<"\n  beta3(0) from GUDHI query   : "<<gudhi_beta0[3]<<"\n  beta3(0) from intervals     : "<<interval_beta0[3]<<"\n  Euler chi at threshold 0    : "<<euler0<<"\n  Stage 5 consistency check   : PASS\n"; rep<<"\nOutput files\n  Pairs               : "<<(od/"persistence_pairs.csv").string()<<"\n  Barcode summary     : "<<(od/"barcode_summary.csv").string()<<"\n  Betti curve         : "<<(od/"betti_curve.csv").string()<<"\n"; for(int d:opt.dims) rep<<"  Diagram dim "<<d<<"       : "<<(od/("diagram_dim"+std::to_string(d)+".csv")).string()<<"\n"; rep<<"  JSON summary        : "<<(od/"captop_persistence_summary.json").string()<<"\n  Diagram manifest    : "<<(od/"captop_diagram_manifest.json").string()<<"\n  Report              : "<<(od/"captop_persistence_report.txt").string()<<"\n\nReady for Stage 9 Python metric layer (cubic_fold_compare.py): yes\n============================================================\n";
     { std::ofstream r(od/"captop_persistence_report.txt"); r<<rep.str(); }
     for(auto&n:names) if(!std::filesystem::exists(od/n)) std::cerr<<"warning: expected output file missing: "<<(od/n).string()<<"\n";
     if(!opt.quiet) std::cout<<rep.str();
