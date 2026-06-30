@@ -54,7 +54,7 @@
 
 namespace captop {
 
-static const char* CAPTOP_VERSION = "0.1.0-stage7";
+static const char* CAPTOP_VERSION = "0.1.0-stage7.2";
 
 enum class GridMode {
     StrictCube,
@@ -2564,15 +2564,54 @@ static int run_persist(int argc,char** argv){
 #ifdef CAPTOP_WITH_GUDHI
     using Base=Gudhi::cubical_complex::Bitmap_cubical_complex_base<double>; using Complex=Gudhi::cubical_complex::Bitmap_cubical_complex<Base>; using Field=Gudhi::persistent_cohomology::Field_Zp; using Pcoh=Gudhi::persistent_cohomology::Persistent_cohomology<Complex,Field>;
     std::vector<unsigned> gdims={static_cast<unsigned>(vr.nx),static_cast<unsigned>(vr.ny),static_cast<unsigned>(vr.nz)}; Complex cc(gdims,comp,true); Pcoh pcoh(cc); pcoh.init_coefficients(opt.field); pcoh.compute_persistent_cohomology(opt.min_persistence);
-    std::stringstream diag; pcoh.output_diagram(diag); std::vector<PersistenceInterval> ints; std::string line;
-    while(std::getline(diag,line)){ std::istringstream ls(line); int d; double b,death; if(!(ls>>d>>b)) continue; bool inf=false; if(!(ls>>death)){ death=std::numeric_limits<double>::infinity(); inf=true; } if(std::isinf(death)) inf=true; if(d<0||d>3) continue; if(opt.finite_only&&inf) continue; double pers=inf?std::numeric_limits<double>::infinity():death-b; if(!inf && pers+1e-14<opt.min_persistence) continue; PersistenceInterval pi; pi.dim=d; pi.bc=b; pi.dc=death; pi.inf=inf; pi.death_type=inf?"infinite_death":"finite"; pi.pers=pers; pi.bp=(opt.mode=="superlevel"?-b:b); pi.dp=inf?(opt.mode=="superlevel"?-std::numeric_limits<double>::infinity():std::numeric_limits<double>::infinity()):(opt.mode=="superlevel"?-death:death); pi.alive_at_zero=interval_alive_at(pi.bc,pi.dc,pi.inf,0.0); ints.push_back(pi); }
+    // ---- Stage 7.2: extract the COMPLETE diagram with true deaths ----
+    // Previously we parsed pcoh.output_diagram(), whose text serialization can
+    // OMIT classes (notably threshold-zero-alive cubical classes), and then
+    // materialized the missing ones as synthetic (0, +inf) tokens. That discarded
+    // the genuine FINITE deaths those classes have, making the diagram CSV lossy
+    // for the alive-at-zero subset. We now read the full pairing directly from
+    // GUDHI's API via get_persistent_pairs(), which returns every paired class
+    // with its birth/death SIMPLICES; the filtration values of those simplices are
+    // the exact birth/death. Unpaired classes (genuinely essential) have a death
+    // simplex equal to the "null" key and are the ONLY ones reported as infinite.
+    std::vector<PersistenceInterval> ints;
+    auto add_interval=[&](int d,double b,double death,bool inf){
+        if(d<0||d>3) return;
+        if(opt.finite_only&&inf) return;
+        double pers=inf?std::numeric_limits<double>::infinity():death-b;
+        if(!inf && pers+1e-14<opt.min_persistence) return;
+        PersistenceInterval pi; pi.dim=d; pi.bc=b; pi.dc=death; pi.inf=inf;
+        pi.death_type=inf?"infinite_death":"finite"; pi.pers=pers;
+        pi.bp=(opt.mode=="superlevel"?-b:b);
+        pi.dp=inf?(opt.mode=="superlevel"?-std::numeric_limits<double>::infinity():std::numeric_limits<double>::infinity())
+                 :(opt.mode=="superlevel"?-death:death);
+        pi.alive_at_zero=interval_alive_at(pi.bc,pi.dc,pi.inf,0.0);
+        ints.push_back(pi);
+    };
+    {
+        auto pairs = pcoh.get_persistent_pairs();
+        for(const auto& p : pairs){
+            // p = (birth_simplex, death_simplex, coefficient). Dimension is the
+            // dimension of the birth simplex; filtration() gives the values.
+            auto birth_simplex = std::get<0>(p);
+            auto death_simplex = std::get<1>(p);
+            int d = cc.dimension(birth_simplex);
+            double b = cc.filtration(birth_simplex);
+            bool inf = (death_simplex == cc.null_simplex());
+            double death = inf ? std::numeric_limits<double>::infinity()
+                               : cc.filtration(death_simplex);
+            // Guard against numerically-zero-length pairs from degenerate cells.
+            if(!inf && death < b) std::swap(b, death);
+            add_interval(d, b, death, inf);
+        }
+    }
     std::map<int,long long> gudhi_beta0, interval_beta0; for(int d=0; d<=3; ++d){ gudhi_beta0[d]=pcoh.persistent_betti_number(d,0.0,0.0); interval_beta0[d]=0; }
     for(auto&x:ints) if(x.alive_at_zero) interval_beta0[x.dim]++;
-    /* GUDHI's text diagram can omit classes with infinite death in cubical occupancy
-       filtrations.  Preserve the API-derived Betti numbers by materializing the
-       missing threshold-zero classes as essential intervals born at zero. */
-    for(int d=0; d<=3; ++d){ while(interval_beta0[d] < gudhi_beta0[d]){ PersistenceInterval pi; pi.dim=d; pi.bc=0.0; pi.dc=std::numeric_limits<double>::infinity(); pi.bp=0.0; pi.dp=(opt.mode=="superlevel"?-std::numeric_limits<double>::infinity():std::numeric_limits<double>::infinity()); pi.pers=std::numeric_limits<double>::infinity(); pi.inf=true; pi.death_type="essential_unpaired"; pi.alive_at_zero=true; ints.push_back(pi); interval_beta0[d]++; } }
-    for(int d=0; d<=3; ++d){ if(dim_requested(opt,d) && interval_beta0[d]!=gudhi_beta0[d]) throw std::runtime_error("interval-derived Betti numbers do not match GUDHI persistent Betti query at threshold 0"); }
+    // The full get_persistent_pairs() extraction should already reproduce the
+    // API Betti query exactly (no omission), so the old synthetic-token loop is
+    // gone. We keep the consistency CHECK as a hard guard: if these ever differ
+    // the extraction missed something and we must not emit a wrong diagram.
+    for(int d=0; d<=3; ++d){ if(dim_requested(opt,d) && interval_beta0[d]!=gudhi_beta0[d]) throw std::runtime_error("interval-derived Betti at 0 (dim "+std::to_string(d)+", got "+std::to_string(interval_beta0[d])+") != GUDHI persistent Betti query ("+std::to_string(gudhi_beta0[d])+"); diagram extraction is incomplete"); }
     long long euler0=gudhi_beta0[0]-gudhi_beta0[1]+gudhi_beta0[2]-gudhi_beta0[3];
     std::sort(ints.begin(),ints.end(),[](const auto&a,const auto&b){ return std::make_tuple(a.dim,a.bc,a.inf,a.dc)<std::make_tuple(b.dim,b.bc,b.inf,b.dc); });
     std::filesystem::path od(opt.out_dir); std::filesystem::create_directories(od); std::vector<std::string> names={"persistence_pairs.csv","barcode_summary.csv","betti_curve.csv","captop_persistence_summary.json","captop_persistence_report.txt","captop_diagram_manifest.json"}; for(int d:opt.dims) names.push_back("diagram_dim"+std::to_string(d)+".csv"); if(opt.write_grid){ names.push_back("captop_occupied_u8.raw"); names.push_back("captop_cube_values_f64.raw"); names.push_back("captop_grid_metadata.json"); } for(auto&n:names) if(!opt.overwrite&&std::filesystem::exists(od/n)) throw std::runtime_error("output file already exists: "+(od/n).string());
@@ -2631,7 +2670,7 @@ static int run_persist(int argc,char** argv){
       std::string metric_axis = "physical";   // compare in *_physical columns
       f<<"{\n";
       f<<"  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n";
-      f<<"  \"schema\": {\"format\": \"captop_diagram_manifest\", \"version\": 1},\n";
+      f<<"  \"schema\": {\"format\": \"captop_diagram_manifest\", \"version\": 2, \"deaths_faithful\": true},\n";
       f<<"  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n";
       f<<"  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz
        <<", \"spacing_h\": "<<vr.spacing.x<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"]},\n";
@@ -2663,7 +2702,7 @@ static int run_persist(int argc,char** argv){
         f<<"  \"grid_files\": null,\n";
       }
       f<<"  \"diagram_columns\": [\"birth\", \"death\", \"birth_physical\", \"death_physical\", \"death_type\", \"persistence\", \"alive_at_zero\"],\n";
-      f<<"  \"diagram_column_notes\": {\"birth\": \"computational filtration value\", \"birth_physical\": \"physical value in 'units' (USE THIS for metric distance)\", \"death_type\": \"finite | infinite_death | essential_unpaired\", \"alive_at_zero\": \"feature present at threshold 0 (the occupied/interface slice)\", \"infinite_death\": \"death encoded as 'inf' string in CSV\"},\n";
+      f<<"  \"diagram_column_notes\": {\"birth\": \"computational filtration value\", \"birth_physical\": \"physical value in 'units' (USE THIS for metric distance)\", \"death_type\": \"finite | infinite_death (since stage7.2 every non-essential class carries its TRUE finite death; alive_at_zero bars are finite with real deaths, not synthetic inf)\", \"alive_at_zero\": \"feature present at threshold 0 (the occupied/interface slice); may be finite\", \"infinite_death\": \"death encoded as 'inf' string in CSV; ONLY genuinely essential classes\"},\n";
       f<<"  \"dimensions\": [";
       { bool first=true; for(int d:opt.dims){ if(!first) f<<", "; first=false;
           long long nfin=0,ninf=0,ness=0,nal=0; for(auto&x:ints) if(x.dim==d){ if(x.death_type=="finite")nfin++; else if(x.death_type=="infinite_death")ninf++; else ness++; if(x.alive_at_zero)nal++; }
