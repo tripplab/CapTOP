@@ -337,14 +337,68 @@ def _lifetime_multiset(pairs, rel_tol=1e-4):
     return bands
 
 
-def self_check(fold, max_dim=2, rel_tol=1e-4, verbose=True):
-    """Stage 0 gate. Reproduce the fold's diagram from its own grid field and
-    assert it matches what CapTOP wrote (Betti@0 vector + finite-bar lifetime
-    multiset per dimension). Returns a dict report; ok=True iff everything matches.
+def _diagram_bands(pairs, rel_tol=1e-4):
+    """Collapse (birth,death) pairs into bands keyed by ROUNDED (birth,death) using
+    a relative tolerance, returning {(b_round,d_round): count}. Used to compare two
+    finite diagrams as multisets tolerant to last-ULP differences."""
+    if len(pairs) == 0:
+        return {}
+    P = np.asarray(pairs, float)
+    order = np.lexsort((P[:, 1], P[:, 0]))
+    P = P[order]
+    bands = {}
+    i, n = 0, len(P)
+    while i < n:
+        j = i + 1
+        while (j < n
+               and abs(P[j, 0] - P[i, 0]) <= rel_tol * max(1.0, abs(P[i, 0]))
+               and abs(P[j, 1] - P[i, 1]) <= rel_tol * max(1.0, abs(P[i, 1]))):
+            j += 1
+        bb = round(float(np.mean(P[i:j, 0])), 3)
+        dd = round(float(np.mean(P[i:j, 1])), 3)
+        bands[(bb, dd)] = bands.get((bb, dd), 0) + (j - i)
+        i = j
+    return bands
 
-    This proves field_to_diagrams' index/axis order and units against the
-    authoritative CapTOP diagram, so that the same conversion can be trusted on a
-    perturbed field (Stage 1)."""
+
+def _bands_match(a, b, rel_tol):
+    """Two (birth,death)->count band dicts match iff same total and every band in a
+    has a counterpart in b within rel_tol on BOTH coordinates with equal count."""
+    if sum(a.values()) != sum(b.values()):
+        return False, f"bar counts differ: {sum(a.values())} vs {sum(b.values())}"
+    bkeys = list(b.keys())
+    used = [False] * len(bkeys)
+    for (ba, da), ca in a.items():
+        hit = False
+        for idx, (bb, db) in enumerate(bkeys):
+            if used[idx]:
+                continue
+            if (abs(ba - bb) <= rel_tol * max(1.0, abs(ba))
+                    and abs(da - db) <= rel_tol * max(1.0, abs(da))
+                    and b[(bb, db)] == ca):
+                used[idx] = True
+                hit = True
+                break
+        if not hit:
+            return False, f"band (birth={ba}, death={da})x{ca} has no match"
+    return True, ""
+
+
+def self_check(fold, max_dim=2, rel_tol=1e-4, verbose=True):
+    """Stage 0 gate (strict, complete-diagram equality). Reproduce the fold's
+    diagram from its own grid field via field_to_diagrams and require it to equal,
+    per dimension, the COMPLETE diagram CapTOP wrote:
+
+      * finite bars match as a (birth_physical, death_physical) multiset
+        (relative-tolerance banded), AND
+      * the count of essential (infinite-death) bars matches.
+
+    This is achievable only because CapTOP (>= stage7.2) records the TRUE finite
+    deaths of threshold-zero-alive classes instead of synthetic (0, inf) tokens;
+    against older outputs (schema version 1) the finite multisets will not match
+    and the check correctly fails. Betti@0 agreement is also asserted as the
+    primary proof the index/axis order and units are correct.
+    """
     report = {"label": fold.label, "ok": False, "checks": []}
 
     def record(name, ok, detail=""):
@@ -358,6 +412,15 @@ def self_check(fold, max_dim=2, rel_tol=1e-4, verbose=True):
                "no grid files (re-run CapTOP persist with --write-grid)")
         return report
 
+    # Warn (don't fail yet) if the producer predates faithful deaths.
+    sch = fold.manifest.get("schema", {})
+    if not sch.get("deaths_faithful", sch.get("version", 1) >= 2):
+        record("producer records faithful deaths (schema >= 2)", False,
+               "this CapTOP output predates stage7.2; alive-at-zero deaths are "
+               "synthetic inf and the complete-diagram check cannot pass. Re-run "
+               "CapTOP persist with the stage7.2 binary.")
+        # continue anyway so the user sees the rest, but it will FAIL.
+
     # 1) recompute from the field
     try:
         field = fold.cube_field()
@@ -368,54 +431,36 @@ def self_check(fold, max_dim=2, rel_tol=1e-4, verbose=True):
     record("recompute persistence from field", True,
            f"{fold.nx}x{fold.ny}x{fold.nz} = {field.size} cells")
 
-    # 2) Betti@0 vector vs manifest dimensions[].betti_at_zero
-    man_b0 = {d["dim"]: d.get("betti_at_zero") for d in fold.manifest.get("dimensions", [])}
-    all_ok = True
+    # 2) Betti@0 vector vs manifest (primary correctness proof)
+    man_b0 = {d["dim"]: d.get("betti_at_zero")
+              for d in fold.manifest.get("dimensions", [])}
+    b0_ok = True
     for d in range(max_dim + 1):
         got = out["betti0"].get(d, 0)
         want = man_b0.get(d)
         ok = (want is None) or (got == want)
-        all_ok &= ok
-        record(f"Betti@0 H{d}", ok,
-               f"recomputed={got}  manifest={want}")
-    record("Betti@0 vector matches manifest", all_ok)
+        b0_ok &= ok
+        record(f"Betti@0 H{d}", ok, f"recomputed={got}  manifest={want}")
 
-    # 3) finite-bar lifetime multiset vs the CapTOP diagram CSV, per dimension
-    multiset_ok = True
+    # 3) COMPLETE diagram equality per dimension: finite multiset + essential count
+    diag_ok = True
     for d in range(max_dim + 1):
-        got = _lifetime_multiset(out["diagrams"].get(d, np.empty((0, 2))), rel_tol)
-        want = _lifetime_multiset(fold.diagrams.get(d, np.empty((0, 2))), rel_tol)
-        ok = _multisets_match(got, want, rel_tol)
-        multiset_ok &= ok
-        ng = sum(got.values()); nw = sum(want.values())
-        record(f"H{d} finite-bar lifetimes", ok,
-               f"recomputed {ng} bars in {len(got)} bands; "
-               f"CapTOP {nw} bars in {len(want)} bands")
-    record("finite-bar lifetimes match CapTOP", multiset_ok)
+        got_fin = _diagram_bands(out["diagrams"].get(d, np.empty((0, 2))), rel_tol)
+        want_fin = _diagram_bands(fold.diagrams.get(d, np.empty((0, 2))), rel_tol)
+        fin_ok, why = _bands_match(got_fin, want_fin, rel_tol)
+        ess_got = out["essentials"].get(d, 0)
+        ess_want = fold.essentials.get(d, 0)
+        ess_ok = (ess_got == ess_want)
+        ok = fin_ok and ess_ok
+        diag_ok &= ok
+        detail = (f"finite: recomputed {sum(got_fin.values())} vs CapTOP "
+                  f"{sum(want_fin.values())}; essential: {ess_got} vs {ess_want}")
+        if not fin_ok:
+            detail += f"  [{why}]"
+        record(f"H{d} complete diagram", ok, detail)
 
-    report["ok"] = all_ok and multiset_ok
+    report["ok"] = b0_ok and diag_ok
     return report
-
-
-def _multisets_match(a, b, rel_tol):
-    """Compare two lifetime->count band dicts allowing the band centers to differ
-    by rel_tol (since a and b were banded independently)."""
-    if sum(a.values()) != sum(b.values()):
-        return False
-    bkeys = sorted(b.keys(), reverse=True)
-    used = [False] * len(bkeys)
-    for la, ca in a.items():
-        matched = False
-        for idx, lb in enumerate(bkeys):
-            if used[idx]:
-                continue
-            if abs(la - lb) <= rel_tol * max(1.0, abs(la)) and b[lb] == ca:
-                used[idx] = True
-                matched = True
-                break
-        if not matched:
-            return False
-    return True
 
 
 # ===========================================================================
