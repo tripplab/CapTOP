@@ -603,10 +603,9 @@ def perturbation_floor(fold, max_dim=2, voxels=1, floor_axis="unsigned-linear",
 
     occ = fold.occupancy().astype(bool).reshape(fold.nz, fold.ny, fold.nx)
 
-    # unperturbed diagram IN THE CHOSEN AXIS (recompute, don't reuse the stored one,
-    # unless the axis matches; recomputing keeps axis handling uniform)
-    base_field = captop_sdt(occ.reshape(-1), fold.nx, fold.ny, fold.nz, h, signed, square)
-    base = field_to_diagrams(base_field, fold.nx, fold.ny, fold.nz, max_dim)
+    # unperturbed diagram IN THE CHOSEN AXIS, via the shared recompute path so the
+    # floor's base diagram is bit-identical to what compare_folds uses for this fold.
+    base = fold_diagrams_on_axis(fold, floor_axis, max_dim)
 
     struct = ndimage.generate_binary_structure(3, 1)   # 6-connectivity (faces)
     per_direction = {}
@@ -640,22 +639,171 @@ def perturbation_floor(fold, max_dim=2, voxels=1, floor_axis="unsigned-linear",
             "voxels": voxels, "sdt_check": (sdt_ok, sdt_maxdiff)}
 
 
-def compare_folds(fold_a, fold_b, max_dim=2, axis_check=True):
-    """Stage 2 [NOT IMPLEMENTED]. Per-dimension bottleneck + 1-Wasserstein between
-    two folds on the unsigned-linear axis. HARD-REQUIRES matching comparability_key
-    AND matching h before computing anything (cross-h or cross-axis distances are
-    meaningless)."""
-    raise NotImplementedError(
-        "Stage 2 (compare_folds): per-dim bottleneck/Wasserstein, gated on "
-        "matching comparability_key AND matching h.")
+def _axis_to_flags(fold, axis):
+    """Map an axis name to (signed, square, h) for a fold. 'as-stored' reads the
+    fold's own manifest SDT flags; the named axes override them. h always comes
+    from the fold (the occupancy grid is axis-independent)."""
+    _, _, h = _sdt_flags_from_manifest(fold)
+    named = {
+        "unsigned-linear": (False, False),
+        "signed-linear":   (True,  False),
+        "signed-square":   (True,  True),
+    }
+    if axis == "as-stored":
+        signed, square, _ = _sdt_flags_from_manifest(fold)
+        return signed, square, h
+    if axis in named:
+        s, q = named[axis]
+        return s, q, h
+    raise ValueError(f"unknown axis '{axis}'")
 
 
-def verdict(fold_pairs, floors, max_dim=2):
-    """Stage 3 [NOT IMPLEMENTED]. Per-pair floor = max of the two folds' Stage-1
-    floors; a pair is a REAL fold difference iff some dimension's distance clears
-    its own floor (mirrors alpha_fold_compare's verdict logic)."""
-    raise NotImplementedError(
-        "Stage 3 (verdict): per-pair floor verdict mirroring alpha_fold_compare.")
+def fold_diagrams_on_axis(fold, axis, max_dim=2):
+    """Recompute a fold's per-dimension diagrams from its OCCUPANCY on the given
+    axis, via the Stage-0-proven field_to_diagrams. THE single path by which any
+    diagram enters a distance computation (both the cross-fold comparison and the
+    perturbation floor route through here), so the compared diagrams and the floor
+    are guaranteed to live on the identical axis by construction.
+
+    Uses the CapTOP-exact SDT reproducer, which the Stage-1 self-assertion proves
+    reproduces CapTOP's stored field bit-exactly on the fold's own axis."""
+    if not fold.has_grid:
+        raise RuntimeError(
+            f"fold '{fold.label}': needs grid files (--write-grid) to recompute "
+            f"diagrams on a chosen axis")
+    signed, square, h = _axis_to_flags(fold, axis)
+    occ = fold.occupancy().astype(bool)
+    fld = captop_sdt(occ, fold.nx, fold.ny, fold.nz, h, signed, square)
+    return field_to_diagrams(fld, fold.nx, fold.ny, fold.nz, max_dim)
+
+
+def _wasserstein(diag_a, diag_b, order=1.0, internal_p=2.0):
+    """1-Wasserstein between two finite diagrams (empty-safe). Returns NaN (with a
+    one-time note) if the optimal-transport backend (POT, `import ot`) is missing,
+    since Wasserstein is corroborating signal only - the verdict gates on bottleneck,
+    which has no such dependency."""
+    try:
+        from gudhi.wasserstein import wasserstein_distance
+    except (ImportError, ModuleNotFoundError):
+        if not _wasserstein._warned:
+            print("[note] Wasserstein unavailable (POT/`ot` not installed); "
+                  "reporting bottleneck only. `pip install pot` to enable.",
+                  file=sys.stderr)
+            _wasserstein._warned = True
+        return float("nan")
+    A = diag_a if len(diag_a) else np.empty((0, 2))
+    B = diag_b if len(diag_b) else np.empty((0, 2))
+    try:
+        return float(wasserstein_distance(A, B, order=order, internal_p=internal_p))
+    except (ImportError, ModuleNotFoundError):
+        if not _wasserstein._warned:
+            print("[note] Wasserstein unavailable (POT/`ot` not installed); "
+                  "reporting bottleneck only. `pip install pot` to enable.",
+                  file=sys.stderr)
+            _wasserstein._warned = True
+        return float("nan")
+
+
+_wasserstein._warned = False
+
+
+def compute_fold_floor(fold, axis, max_dim=2, voxels=1, verbose=False, _cache={}):
+    """Stage 1 floor for one fold on `axis`, COMPUTED ONCE and cached by
+    (path, axis, voxels). Stage 3 combines per-fold floors per pair, so a fold that
+    appears in many pairs pays for its floor only once. Returns {d: bottleneck}."""
+    key = (os.path.abspath(fold.path), axis, voxels, max_dim)
+    if key in _cache:
+        return _cache[key]
+    res = perturbation_floor(fold, max_dim=max_dim, voxels=voxels,
+                             floor_axis=axis, verbose=verbose)
+    _cache[key] = res["floor"]
+    return res["floor"]
+
+
+def _check_comparable(fold_a, fold_b):
+    """Hard gate before any cross-fold distance. Returns (ok, reason). Requires
+    matching comparability_key AND matching h (the key intentionally omits h, so h
+    is checked separately; cross-h distances measure discretization, not folds)."""
+    if fold_a.comparability_key != fold_b.comparability_key:
+        return False, (f"comparability_key mismatch: "
+                       f"'{fold_a.comparability_key}' vs '{fold_b.comparability_key}' "
+                       f"(different filtration/units/mode/sdt settings)")
+    if fold_a.h is None or fold_b.h is None:
+        return False, "spacing h unknown for one fold"
+    if abs(fold_a.h - fold_b.h) > 1e-6 * max(1.0, abs(fold_a.h)):
+        return False, (f"resolution mismatch: h={fold_a.h:g} vs h={fold_b.h:g}; "
+                       f"fold-vs-fold requires matching h (finite-bar counts scale "
+                       f"with resolution, so cross-h distances measure the mesh, "
+                       f"not the fold)")
+    return True, ""
+
+
+def compare_folds(fold_a, fold_b, axis="unsigned-linear", max_dim=2):
+    """Stage 2. Per-dimension bottleneck + 1-Wasserstein between two folds, on
+    `axis`. HARD-REQUIRES matching comparability_key AND matching h. Both folds'
+    diagrams are recomputed on the SAME axis via fold_diagrams_on_axis, so the
+    distances and the Stage-1 floor (also on `axis`) are guaranteed consistent.
+
+    Returns {d: {'bottleneck':bn, 'wasserstein':wd, 'npts_a':.., 'npts_b':..,
+                 'ess_a':.., 'ess_b':..}}."""
+    ok, why = _check_comparable(fold_a, fold_b)
+    if not ok:
+        raise RuntimeError(f"cannot compare '{fold_a.label}' vs '{fold_b.label}': {why}")
+    da = fold_diagrams_on_axis(fold_a, axis, max_dim)
+    db = fold_diagrams_on_axis(fold_b, axis, max_dim)
+    out = {}
+    for d in range(max_dim + 1):
+        A = da["diagrams"].get(d, np.empty((0, 2)))
+        B = db["diagrams"].get(d, np.empty((0, 2)))
+        out[d] = {
+            "bottleneck": _bottleneck(A, B),
+            "wasserstein": _wasserstein(A, B),
+            "npts_a": len(A), "npts_b": len(B),
+            "ess_a": da["essentials"].get(d, 0), "ess_b": db["essentials"].get(d, 0),
+        }
+    return out
+
+
+def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True):
+    """Stage 3. For every pair of folds: per-dimension bottleneck/Wasserstein
+    (Stage 2), a per-pair floor = max of the two folds' Stage-1 floors (each
+    computed once and cached), and the verdict 'REAL fold difference' iff ANY
+    dimension's bottleneck clears its own pair floor (the permissive rule mirroring
+    alpha_fold_compare). Per-dimension clears/noise is reported so the discriminating
+    dimension is visible (H2 is expected to carry it; H0 is typically floor 0).
+
+    Returns a list of per-pair result dicts."""
+    import itertools
+    # gate all pairs up front so we fail fast on any incompatibility
+    labels = [f.label for f in folds]
+    for a, b in itertools.combinations(folds, 2):
+        ok, why = _check_comparable(a, b)
+        if not ok:
+            raise RuntimeError(f"cannot compare '{a.label}' vs '{b.label}': {why}")
+
+    # per-fold floors, computed once each (cached)
+    if verbose:
+        print("per-fold selector-stability floors "
+              f"(axis={axis}, +/-{voxels} vox), computed once each:")
+    floors = {}
+    for f in folds:
+        floors[f.label] = compute_fold_floor(f, axis, max_dim, voxels, verbose=False)
+        if verbose:
+            fl = floors[f.label]
+            print(f"  {f.label:<20} "
+                  + "  ".join(f"H{d}={fl[d]:.4g}" for d in range(max_dim + 1)))
+
+    results = []
+    for a, b in itertools.combinations(folds, 2):
+        per = compare_folds(a, b, axis=axis, max_dim=max_dim)
+        pair_floor = {d: max(floors[a.label][d], floors[b.label][d])
+                      for d in range(max_dim + 1)}
+        clears = {d: per[d]["bottleneck"] > pair_floor[d] for d in range(max_dim + 1)}
+        is_real = any(clears.values())
+        results.append({"a": a.label, "b": b.label, "per": per,
+                        "pair_floor": pair_floor, "clears": clears,
+                        "real": is_real, "axis": axis})
+    return results
 
 
 def capsid_vs_mesh_table(alpha_diagram_dir, mesh_fold, max_dim=2):
@@ -699,10 +847,13 @@ def main():
                            "This proves the field->complex->diagram conversion the "
                            "whole module reuses. Exit 0 on PASS, 1 on FAIL.")
     mode.add_argument("--compare", nargs="+", metavar="DIR",
-                      help="STAGE 2+ (not yet implemented): per-dimension "
-                           "bottleneck/Wasserstein between folds on the unsigned-"
-                           "linear axis, gated by matching comparability_key and h, "
-                           "with a per-pair selector-stability noise-floor verdict.")
+                      help="STAGE 2-3 (active): per-dimension bottleneck/Wasserstein "
+                           "between folds on --floor-axis (default unsigned-linear), "
+                           "gated by matching comparability_key AND matching h, with "
+                           "a per-pair selector-stability floor (each fold's Stage-1 "
+                           "floor computed once and cached) and a 'REAL iff any "
+                           "dimension clears its pair floor' verdict. Needs "
+                           "--write-grid output for every fold.")
     mode.add_argument("--floor", metavar="DIR",
                       help="STAGE 1 (active): compute the selector-stability noise "
                            "floor for one fold - dilate/erode the occupancy by +/-1 "
@@ -786,12 +937,50 @@ def main():
               "signal (Stage 3 verdict).")
         return
 
-    # ---- --compare : not yet ----
+    # ---- --compare : Stage 2-3 (needs gudhi + scipy) ----
     if args.compare:
-        sys.exit("[stage 2+] --compare is not implemented yet. Stage 0 "
-                 "(--self-check) must pass on representative folds first; then "
-                 "Stages 1-3 (perturbation floor, bottleneck/Wasserstein, verdict) "
-                 "land additively. See the STAGE MAP in this file's docstring.")
+        if len(args.compare) < 2:
+            sys.exit("[error] --compare needs at least two fold directories")
+        _check_gudhi()
+        folds = [load_fold(p) for p in args.compare]
+        for f in folds:
+            if not f.has_grid:
+                sys.exit(f"[error] fold '{f.label}' has no grid files; re-run "
+                         f"CapTOP persist with --write-grid (needed for the "
+                         f"axis-consistent recompute and the floor).")
+        print(f"comparing {len(folds)} folds on axis={args.floor_axis}, "
+              f"floor +/-{args.floor_voxels} vox")
+        print("=" * 72)
+        try:
+            results = verdict(folds, axis=args.floor_axis, max_dim=args.max_dim,
+                              voxels=args.floor_voxels, verbose=True)
+        except RuntimeError as exc:
+            sys.exit(f"[error] {exc}")
+
+        print("\n" + "=" * 72)
+        print("cross-fold distances (bottleneck bn, 1-Wasserstein w) on "
+              f"axis={args.floor_axis}")
+        print("=" * 72)
+        for r in results:
+            cells = " | ".join(
+                f"H{d}: bn={r['per'][d]['bottleneck']:.4g} "
+                f"w={r['per'][d]['wasserstein']:.4g}"
+                for d in range(args.max_dim + 1))
+            print(f"  {r['a']} vs {r['b']}\n    {cells}")
+
+        print("\n" + "=" * 72)
+        print("verdict (REAL iff ANY dimension's bottleneck clears its pair floor)")
+        print("=" * 72)
+        for r in results:
+            tag = ("REAL fold difference" if r["real"]
+                   else "within noise floor (not significant)")
+            print(f"  {r['a']} vs {r['b']}  ->  {tag}")
+            print("      " + "   ".join(
+                f"H{d}: {r['per'][d]['bottleneck']:.4g} vs "
+                f"floor {r['pair_floor'][d]:.4g} "
+                f"{'CLEARS' if r['clears'][d] else 'noise'}"
+                for d in range(args.max_dim + 1)))
+        return
 
 
 if __name__ == "__main__":
