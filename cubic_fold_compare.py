@@ -466,15 +466,178 @@ def self_check(fold, max_dim=2, rel_tol=1e-4, verbose=True):
 # ===========================================================================
 # Stage 1+ : STUBS - named homes for the already-designed stages.
 # ===========================================================================
-def perturbation_floor(fold, max_dim=2, voxels=1, seed=0):
-    """Stage 1 [NOT IMPLEMENTED]. The cubical analogue of alpha_fold_compare
-    control 2 (selector stability): morphologically dilate/erode the occupancy by
-    `voxels`, recompute the SDT field, run field_to_diagrams, and bottleneck the
-    perturbed diagram against the unperturbed one - per dimension. Needs grid files
-    (occupancy) and reuses field_to_diagrams verbatim. Returns a per-dim floor."""
-    raise NotImplementedError(
-        "Stage 1 (perturbation_floor): +/-voxel occupancy nudge -> SDT -> "
-        "field_to_diagrams -> bottleneck-to-self. Gated on Stage 0 passing.")
+def captop_sdt(occ_flat, nx, ny, nz, h, signed, square):
+    """Reproduce CapTOP's signed distance transform from a FLAT occupancy array in
+    CapTOP index order (i + nx*(j + ny*k)). Returns the flat float64 field in the
+    same order.
+
+    Convention (identical to captop.cpp build_sdt_field):
+      * physical Euclidean distance (Angstrom) between cube centers, scaled by h;
+      * NEGATIVE inside the occupied solid, POSITIVE in the void;
+      * unsigned (signed=False): occupied cells -> 0, distance grows into the void;
+      * signed  (signed=True) : occupied -> -(distance to nearest empty),
+                                empty    -> +(distance to nearest occupied);
+      * square  (square=True) : value = sign(d) * d^2  (Angstrom^2), applied last.
+
+    scipy's distance_transform_edt(x) returns, at each cell, the distance to the
+    nearest ZERO (background) cell of x. So distance-to-nearest-occupied = EDT(~occ)
+    and distance-to-nearest-empty = EDT(occ). The (nz,ny,nx) reshape with C-order
+    makes the last axis (i) vary fastest, matching CapTOP's flat order exactly
+    (verified: reshape->flatten round-trips and r[k,j,i] == flat[i+nx*(j+ny*k)]).
+    """
+    from scipy import ndimage
+    occ = np.asarray(occ_flat, bool).reshape(nz, ny, nx)     # [k, j, i]
+    out = ndimage.distance_transform_edt(~occ) * h           # 0 on occupied, >0 void
+    if not signed:
+        field = out
+    else:
+        inn = ndimage.distance_transform_edt(occ) * h        # 0 on void, >0 inside
+        field = np.where(occ, -inn, out)                     # negative inside
+    if square:
+        field = np.sign(field) * field * field
+    return np.ascontiguousarray(field.reshape(-1), dtype=float)
+
+
+def _sdt_flags_from_manifest(fold):
+    """Read (signed, square, h) for the fold's SDT from its manifest. Raises if the
+    fold is not an SDT filtration (the floor is only defined for SDT)."""
+    filt = fold.manifest.get("filtration", {})
+    sdt = filt.get("sdt")
+    if not sdt or not sdt.get("enabled"):
+        raise RuntimeError(
+            f"fold '{fold.label}': perturbation floor is only defined for an SDT "
+            f"filtration; manifest filtration.sdt is absent/disabled")
+    signed = bool(sdt.get("signed"))
+    square = bool(sdt.get("square"))
+    if fold.h is None:
+        raise RuntimeError(f"fold '{fold.label}': spacing h unknown; cannot scale SDT")
+    return signed, square, float(fold.h)
+
+
+def assert_sdt_reproduces_field(fold, rtol=1e-6, atol=1e-6):
+    """Prove the Python SDT reproduces CapTOP's stored field on the UNPERTURBED
+    occupancy, before any perturbed field is trusted. This is the Stage-1 analogue
+    of the Stage-0 self-check: it guarantees the perturbation measures real boundary
+    sensitivity, not a convention mismatch between captop.cpp and scipy.
+
+    Returns (ok, max_abs_diff). Compares only where both are finite (the field is
+    finite everywhere for a valid SDT, so that is the whole grid)."""
+    signed, square, h = _sdt_flags_from_manifest(fold)
+    occ = fold.occupancy().astype(bool)
+    stored = fold.cube_field()
+    recomputed = captop_sdt(occ, fold.nx, fold.ny, fold.nz, h, signed, square)
+    finite = np.isfinite(stored) & np.isfinite(recomputed)
+    if not finite.any():
+        return False, np.inf
+    diff = np.abs(stored[finite] - recomputed[finite])
+    max_abs = float(diff.max())
+    scale = np.maximum(np.abs(stored[finite]), np.abs(recomputed[finite]))
+    ok = bool(np.all(diff <= atol + rtol * scale))
+    return ok, max_abs
+
+
+def _bottleneck(diag_a, diag_b):
+    """Bottleneck distance between two finite diagrams (N,2 arrays). Empty-safe."""
+    import gudhi
+    A = diag_a if len(diag_a) else np.empty((0, 2))
+    B = diag_b if len(diag_b) else np.empty((0, 2))
+    return float(gudhi.bottleneck_distance(A, B))
+
+
+def perturbation_floor(fold, max_dim=2, voxels=1, floor_axis="unsigned-linear",
+                       verbose=True):
+    """Stage 1. Selector-stability noise floor: the cubical analogue of
+    alpha_fold_compare's control 2. Nudge the occupancy boundary by +/- `voxels`
+    (binary dilation and erosion), recompute the SDT the way CapTOP does, rebuild
+    the diagram via the Stage-0-proven field_to_diagrams, and bottleneck each
+    perturbed diagram against the unperturbed one. The floor per dimension is the
+    WORST (max) over the two perturbation directions.
+
+    floor_axis selects the axis the floor is computed on, which MUST match the axis
+    the eventual fold-vs-fold comparison uses:
+      'unsigned-linear' (default) : d in Angstrom, unsigned  -> for fold-vs-fold
+      'signed-linear'             : d in Angstrom, signed
+      'signed-square'             : sign(d)*d^2 in Angstrom^2 -> capsid-vs-mesh axis
+      'as-stored'                 : whatever the fold's own manifest says
+    The occupancy is the same regardless of axis; only the SDT mapping differs, so
+    the floor is derived from occupancy + the chosen axis, independent of how the
+    stored .raw was squared.
+
+    Requires grid files (--write-grid). Returns dict:
+      {'floor': {d: bottleneck}, 'per_direction': {...}, 'axis': ..., 'voxels': ...,
+       'sdt_check': (ok, max_abs_diff)}
+    """
+    from scipy import ndimage
+    if not fold.has_grid:
+        raise RuntimeError(
+            f"fold '{fold.label}': perturbation floor needs grid files; re-run "
+            f"CapTOP persist with --write-grid")
+
+    # axis -> (signed, square); h from the fold
+    _, _, h = _sdt_flags_from_manifest(fold)
+    axis_map = {
+        "unsigned-linear": (False, False),
+        "signed-linear":   (True,  False),
+        "signed-square":   (True,  True),
+    }
+    if floor_axis == "as-stored":
+        signed, square, _ = _sdt_flags_from_manifest(fold)
+    elif floor_axis in axis_map:
+        signed, square = axis_map[floor_axis]
+    else:
+        raise ValueError(f"unknown floor_axis '{floor_axis}'")
+
+    # 0) prove the SDT reproducer matches CapTOP on the unperturbed occupancy, in
+    #    the fold's OWN stored axis (that is the only axis we can cross-check against
+    #    the .raw). A convention bug would surface here before we trust perturbations.
+    sdt_ok, sdt_maxdiff = assert_sdt_reproduces_field(fold)
+    if verbose:
+        print(f"  SDT reproducer vs stored field: "
+              f"{'OK' if sdt_ok else 'MISMATCH'} (max |diff| = {sdt_maxdiff:.3g})")
+    if not sdt_ok:
+        raise RuntimeError(
+            f"fold '{fold.label}': Python SDT does not reproduce CapTOP's stored "
+            f"field (max |diff| = {sdt_maxdiff:.3g}); the perturbation floor would "
+            f"be measuring a convention mismatch, not boundary sensitivity. Fix "
+            f"captop_sdt to match captop.cpp build_sdt_field before trusting Stage 1.")
+
+    occ = fold.occupancy().astype(bool).reshape(fold.nz, fold.ny, fold.nx)
+
+    # unperturbed diagram IN THE CHOSEN AXIS (recompute, don't reuse the stored one,
+    # unless the axis matches; recomputing keeps axis handling uniform)
+    base_field = captop_sdt(occ.reshape(-1), fold.nx, fold.ny, fold.nz, h, signed, square)
+    base = field_to_diagrams(base_field, fold.nx, fold.ny, fold.nz, max_dim)
+
+    struct = ndimage.generate_binary_structure(3, 1)   # 6-connectivity (faces)
+    per_direction = {}
+    floor = {d: 0.0 for d in range(max_dim + 1)}
+    for name, op in (("dilate", ndimage.binary_dilation),
+                     ("erode", ndimage.binary_erosion)):
+        occ_p = op(occ, structure=struct, iterations=voxels)
+        # guard: perturbation must keep both phases (else SDT is undefined)
+        n_occ = int(occ_p.sum()); n_tot = occ_p.size
+        if n_occ == 0 or n_occ == n_tot:
+            if verbose:
+                print(f"  [skip] {name}: perturbation removed a phase "
+                      f"(occupied={n_occ}/{n_tot})")
+            per_direction[name] = None
+            continue
+        field_p = captop_sdt(occ_p.reshape(-1), fold.nx, fold.ny, fold.nz,
+                             h, signed, square)
+        pert = field_to_diagrams(field_p, fold.nx, fold.ny, fold.nz, max_dim)
+        dists = {}
+        for d in range(max_dim + 1):
+            bn = _bottleneck(base["diagrams"].get(d, np.empty((0, 2))),
+                             pert["diagrams"].get(d, np.empty((0, 2))))
+            dists[d] = bn
+            floor[d] = max(floor[d], bn)
+        per_direction[name] = dists
+        if verbose:
+            cells = "  ".join(f"H{d}={dists[d]:.4g}" for d in range(max_dim + 1))
+            print(f"  {name} (+/-{voxels} vox): {cells}")
+
+    return {"floor": floor, "per_direction": per_direction, "axis": floor_axis,
+            "voxels": voxels, "sdt_check": (sdt_ok, sdt_maxdiff)}
 
 
 def compare_folds(fold_a, fold_b, max_dim=2, axis_check=True):
@@ -540,6 +703,15 @@ def main():
                            "bottleneck/Wasserstein between folds on the unsigned-"
                            "linear axis, gated by matching comparability_key and h, "
                            "with a per-pair selector-stability noise-floor verdict.")
+    mode.add_argument("--floor", metavar="DIR",
+                      help="STAGE 1 (active): compute the selector-stability noise "
+                           "floor for one fold - dilate/erode the occupancy by +/-1 "
+                           "voxel, recompute the SDT, rebuild the diagram, and "
+                           "bottleneck each perturbation against the unperturbed "
+                           "diagram (worst per dimension). Requires --write-grid "
+                           "output. First asserts the Python SDT reproduces CapTOP's "
+                           "stored field. This is the cubical analogue of "
+                           "alpha_fold_compare control 2.")
     mode.add_argument("--info", metavar="DIR",
                       help="load a fold and print what was found (manifest units, "
                            "comparability_key, h, per-dim bar counts, whether grid "
@@ -551,6 +723,14 @@ def main():
                     help="relative tolerance for matching finite-bar lifetimes in "
                          "the self-check (default 1e-4; mirrors the alpha-side "
                          "relative-tolerance band collapse)")
+    ap.add_argument("--floor-axis", default="unsigned-linear",
+                    choices=["unsigned-linear", "signed-linear", "signed-square",
+                             "as-stored"],
+                    help="axis on which to compute the perturbation floor; MUST "
+                         "match the axis of the eventual fold-vs-fold comparison "
+                         "(default unsigned-linear, the fold-vs-fold axis)")
+    ap.add_argument("--floor-voxels", type=int, default=1,
+                    help="perturbation size in voxels for --floor (default 1)")
     args = ap.parse_args()
 
     # ---- --info : pure loading, no gudhi ----
@@ -586,6 +766,26 @@ def main():
                   "Do not build later stages until this passes.", file=sys.stderr)
         sys.exit(0 if rep["ok"] else 1)
 
+    # ---- --floor : Stage 1 perturbation floor (needs gudhi + scipy) ----
+    if args.floor:
+        _check_gudhi()
+        fd = load_fold(args.floor)
+        if not fd.has_grid:
+            sys.exit(f"[error] fold '{fd.label}' has no grid files; re-run CapTOP "
+                     f"persist with --write-grid to enable the perturbation floor.")
+        print(f"perturbation floor for fold '{fd.label}'  "
+              f"(axis={args.floor_axis}, +/-{args.floor_voxels} vox, "
+              f"units={fd.units}, h={fd.h})")
+        res = perturbation_floor(fd, max_dim=args.max_dim, voxels=args.floor_voxels,
+                                 floor_axis=args.floor_axis, verbose=True)
+        floor = res["floor"]
+        print("\n  selector-stability floor per dim (worst over dilate/erode):")
+        print("    " + "   ".join(f"H{d}={floor[d]:.4g}"
+                                  for d in range(args.max_dim + 1)))
+        print("\n  a cross-fold bottleneck must EXCEED this to count as real fold "
+              "signal (Stage 3 verdict).")
+        return
+
     # ---- --compare : not yet ----
     if args.compare:
         sys.exit("[stage 2+] --compare is not implemented yet. Stage 0 "
@@ -596,3 +796,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
