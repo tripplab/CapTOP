@@ -43,7 +43,8 @@ STAGE MAP (this file grows additively; only Stage 0 is active today)
                      (selector stability). Reuses field_to_diagrams verbatim.
   Stage 2  [stub]    compare_folds : per-dim bottleneck + 1-Wasserstein between
                      two folds, on the UNSIGNED-LINEAR axis, gated by matching
-                     comparability_key AND matching h.
+                     comparability_key AND h within a relative tolerance (--h-rtol,
+                     default 1e-2), with optional common-h renormalization.
   Stage 3  [stub]    verdict : per-pair floor (max of the two folds' Stage-1
                      floors) -> "REAL fold difference" iff a dimension clears it.
   Stage 4  [stub]    capsid_vs_mesh_table : explicitly NON-metric structural
@@ -54,9 +55,15 @@ STAGE MAP (this file grows additively; only Stage 0 is active today)
 
 DESIGN DECISIONS ALREADY SETTLED (recorded so later stages honor them)
 ----------------------------------------------------------------------
-  * fold-vs-fold REQUIRES matching h (hard error, not a warning): finite-bar
-    counts range over orders of magnitude with resolution (19 -> 50246 for
-    1CWP F2_0 across h=12..1), so cross-h distances measure discretization.
+  * fold-vs-fold REQUIRES h to match within a RELATIVE tolerance (--h-rtol,
+    default 1e-2), a hard error past that: finite-bar counts range over orders of
+    magnitude with resolution (19 -> 50246 for 1CWP F2_0 across h=12..1), so
+    genuinely cross-h distances measure discretization. The tolerance (not exact
+    equality) admits the ~4th-significant-figure h difference between two same-
+    resolution folds voxelized independently; a 2x octree-level change is ~100%,
+    far above any sane tolerance, so real resolution mismatches still hard-fail.
+    Optional --renorm-h rescales all folds to a shared h to erase the residual
+    sub-tolerance skew (off by default; below the noise floor).
   * default fold-vs-fold axis is UNSIGNED-LINEAR (Angstrom). The signed-square
     (Angstrom^2) axis is reserved for the capsid-vs-mesh shared-axis table; its
     huge dynamic range lets one dominant feature swamp the bottleneck.
@@ -82,6 +89,19 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+
+
+# ===========================================================================
+# Tunable defaults
+# ===========================================================================
+# Relative tolerance for the fold-vs-fold spacing (h) match. Two folds that are
+# the SAME nominal resolution but voxelized independently (e.g. different fold
+# orientations meshed separately by OctreeMesh) have h values that differ at the
+# ~4th significant figure -- export/orientation quantization, NOT a resolution
+# difference. Adjacent octree levels differ by 2x (100%), so a 1e-2 gate cleanly
+# admits quantization noise (~1e-3 observed) while still rejecting a true level
+# change with ~50x headroom. Override on the CLI with --h-rtol.
+DEFAULT_H_RTOL = 1e-2
 
 
 # ===========================================================================
@@ -720,41 +740,90 @@ def compute_fold_floor(fold, axis, max_dim=2, voxels=1, verbose=False, _cache={}
     return res["floor"]
 
 
-def _check_comparable(fold_a, fold_b):
+def _renorm_power(axis):
+    """The exponent p such that a fold's diagram coordinates scale as h**p on the
+    given axis: linear axes carry physical distance (h**1); the signed-square axis
+    carries sign*distance**2 (h**2). A common-h renormalization multiplies a fold's
+    diagram (and its floor, which is a bottleneck of such diagrams) by
+    (h_ref/h_fold)**p."""
+    return 2 if axis == "signed-square" else 1
+
+
+def _renorm_factor(h_fold, h_ref, axis):
+    """Scalar that maps a fold's diagram/floor from its own h_fold units to the
+    shared h_ref units. Returns 1.0 when renormalization is off (h_ref is None) or
+    h_fold is unusable, so callers can multiply unconditionally."""
+    if h_ref is None or not h_fold or h_fold <= 0.0:
+        return 1.0
+    return (h_ref / h_fold) ** _renorm_power(axis)
+
+
+def _scale_diagrams(diagrams, s):
+    """Return a new {dim: (N,2) array} with birth/death multiplied by scalar s.
+    s == 1.0 short-circuits to the original arrays (no copy)."""
+    if s == 1.0:
+        return diagrams
+    return {d: (arr * s if len(arr) else arr) for d, arr in diagrams.items()}
+
+
+def _check_comparable(fold_a, fold_b, h_rtol=DEFAULT_H_RTOL):
     """Hard gate before any cross-fold distance. Returns (ok, reason). Requires
-    matching comparability_key AND matching h (the key intentionally omits h, so h
-    is checked separately; cross-h distances measure discretization, not folds)."""
+    matching comparability_key AND h equal within a RELATIVE tolerance h_rtol (the
+    key intentionally omits h, so h is checked separately; genuinely cross-h
+    distances measure discretization, not folds). The tolerance exists because two
+    folds at the same nominal resolution but voxelized independently differ in h at
+    the ~4th significant figure (export/orientation quantization); a 2x octree-level
+    change is ~100%, far above any sane h_rtol, so real resolution mismatches are
+    still rejected."""
     if fold_a.comparability_key != fold_b.comparability_key:
         return False, (f"comparability_key mismatch: "
                        f"'{fold_a.comparability_key}' vs '{fold_b.comparability_key}' "
                        f"(different filtration/units/mode/sdt settings)")
     if fold_a.h is None or fold_b.h is None:
         return False, "spacing h unknown for one fold"
-    if abs(fold_a.h - fold_b.h) > 1e-6 * max(1.0, abs(fold_a.h)):
-        return False, (f"resolution mismatch: h={fold_a.h:g} vs h={fold_b.h:g}; "
-                       f"fold-vs-fold requires matching h (finite-bar counts scale "
-                       f"with resolution, so cross-h distances measure the mesh, "
-                       f"not the fold)")
+    denom = max(abs(fold_a.h), abs(fold_b.h), 1e-300)
+    rel = abs(fold_a.h - fold_b.h) / denom
+    if rel > h_rtol:
+        return False, (f"resolution mismatch: h={fold_a.h:g} vs h={fold_b.h:g} "
+                       f"(relative {rel:.3g} > --h-rtol {h_rtol:g}); fold-vs-fold "
+                       f"requires matching h. If these are the same nominal "
+                       f"resolution and the gap is export/orientation quantization, "
+                       f"raise --h-rtol (a true octree-level change is ~1.0). "
+                       f"Finite-bar counts scale with resolution, so genuinely "
+                       f"cross-h distances measure the mesh, not the fold.")
     return True, ""
 
 
-def compare_folds(fold_a, fold_b, axis="unsigned-linear", max_dim=2):
+def compare_folds(fold_a, fold_b, axis="unsigned-linear", max_dim=2,
+                  h_rtol=DEFAULT_H_RTOL, h_ref=None):
     """Stage 2. Per-dimension bottleneck + 1-Wasserstein between two folds, on
-    `axis`. HARD-REQUIRES matching comparability_key AND matching h. Both folds'
-    diagrams are recomputed on the SAME axis via fold_diagrams_on_axis, so the
-    distances and the Stage-1 floor (also on `axis`) are guaranteed consistent.
+    `axis`. HARD-REQUIRES matching comparability_key AND h within h_rtol. Both
+    folds' diagrams are recomputed on the SAME axis via fold_diagrams_on_axis, so
+    the distances and the Stage-1 floor (also on `axis`) are guaranteed consistent.
+
+    If h_ref is given (common-h renormalization on), each fold's diagram is scaled
+    to the shared h_ref units by (h_ref/h_fold)**p before distances, removing the
+    sub-tolerance scale skew between two independently-meshed folds. h_ref is None
+    (off) by default; the skew it removes is ~1000x below the perturbation floor, so
+    verdicts are unchanged either way. When on, the CALLER must scale each fold's
+    floor by the same factor so distance and floor stay in the same units (verdict
+    does this).
 
     Returns {d: {'bottleneck':bn, 'wasserstein':wd, 'npts_a':.., 'npts_b':..,
                  'ess_a':.., 'ess_b':..}}."""
-    ok, why = _check_comparable(fold_a, fold_b)
+    ok, why = _check_comparable(fold_a, fold_b, h_rtol=h_rtol)
     if not ok:
         raise RuntimeError(f"cannot compare '{fold_a.label}' vs '{fold_b.label}': {why}")
     da = fold_diagrams_on_axis(fold_a, axis, max_dim)
     db = fold_diagrams_on_axis(fold_b, axis, max_dim)
+    sa = _renorm_factor(fold_a.h, h_ref, axis)
+    sb = _renorm_factor(fold_b.h, h_ref, axis)
+    diag_a = _scale_diagrams(da["diagrams"], sa)
+    diag_b = _scale_diagrams(db["diagrams"], sb)
     out = {}
     for d in range(max_dim + 1):
-        A = da["diagrams"].get(d, np.empty((0, 2)))
-        B = db["diagrams"].get(d, np.empty((0, 2)))
+        A = diag_a.get(d, np.empty((0, 2)))
+        B = diag_b.get(d, np.empty((0, 2)))
         out[d] = {
             "bottleneck": _bottleneck(A, B),
             "wasserstein": _wasserstein(A, B),
@@ -764,7 +833,8 @@ def compare_folds(fold_a, fold_b, axis="unsigned-linear", max_dim=2):
     return out
 
 
-def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True):
+def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True,
+            h_rtol=DEFAULT_H_RTOL, renorm_h=False):
     """Stage 3. For every pair of folds: per-dimension bottleneck/Wasserstein
     (Stage 2), a per-pair floor = max of the two folds' Stage-1 floors (each
     computed once and cached), and the verdict 'REAL fold difference' iff ANY
@@ -772,22 +842,41 @@ def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True):
     alpha_fold_compare). Per-dimension clears/noise is reported so the discriminating
     dimension is visible (H2 is expected to carry it; H0 is typically floor 0).
 
+    h_rtol is the relative spacing-match tolerance (see _check_comparable). If
+    renorm_h is True, all folds are renormalized to a single shared h_ref (the mean
+    of the folds' h) before distances: each fold's diagram AND its floor are scaled
+    by (h_ref/h_fold)**p, keeping distance and floor in identical units. This removes
+    the sub-tolerance scale skew between independently-meshed folds; it is off by
+    default because that skew is ~1000x below the floor and cannot change a verdict.
+    The null control (fold vs itself, factor 1.0) stays exactly zero either way.
+
     Returns a list of per-pair result dicts."""
     import itertools
     # gate all pairs up front so we fail fast on any incompatibility
     labels = [f.label for f in folds]
     for a, b in itertools.combinations(folds, 2):
-        ok, why = _check_comparable(a, b)
+        ok, why = _check_comparable(a, b, h_rtol=h_rtol)
         if not ok:
             raise RuntimeError(f"cannot compare '{a.label}' vs '{b.label}': {why}")
 
-    # per-fold floors, computed once each (cached)
+    # common-h renormalization target: mean of the folds' spacings (only when on)
+    h_ref = None
+    if renorm_h:
+        hs = [f.h for f in folds if f.h]
+        h_ref = (sum(hs) / len(hs)) if hs else None
+        if verbose and h_ref is not None:
+            print(f"common-h renormalization ON: h_ref={h_ref:.6g} Angstrom "
+                  f"(diagrams and floors scaled by (h_ref/h_fold)**p per axis)")
+
+    # per-fold floors, computed once each (cached), then scaled to h_ref units
     if verbose:
         print("per-fold selector-stability floors "
               f"(axis={axis}, +/-{voxels} vox), computed once each:")
     floors = {}
     for f in folds:
-        floors[f.label] = compute_fold_floor(f, axis, max_dim, voxels, verbose=False)
+        raw = compute_fold_floor(f, axis, max_dim, voxels, verbose=False)
+        s = _renorm_factor(f.h, h_ref, axis)
+        floors[f.label] = {d: raw[d] * s for d in range(max_dim + 1)}
         if verbose:
             fl = floors[f.label]
             print(f"  {f.label:<20} "
@@ -795,7 +884,8 @@ def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True):
 
     results = []
     for a, b in itertools.combinations(folds, 2):
-        per = compare_folds(a, b, axis=axis, max_dim=max_dim)
+        per = compare_folds(a, b, axis=axis, max_dim=max_dim,
+                            h_rtol=h_rtol, h_ref=h_ref)
         pair_floor = {d: max(floors[a.label][d], floors[b.label][d])
                       for d in range(max_dim + 1)}
         clears = {d: per[d]["bottleneck"] > pair_floor[d] for d in range(max_dim + 1)}
@@ -835,8 +925,14 @@ def main():
                "  # Stage 0: prove the grid contract on the small h=12 fold\n"
                "  %(prog)s --self-check captop_out/out_persist_sdt/1CWP_F2_0_h12\n"
                "\n"
-               "  # (later) compare two same-h folds:\n"
-               "  %(prog)s --compare DIR_A DIR_B            [Stage 2+, not yet]\n")
+               "  # Stage 2-3: compare two folds (same nominal resolution)\n"
+               "  %(prog)s --compare DIR_A DIR_B --floor-axis unsigned-linear\n"
+               "\n"
+               "  # loosen the spacing match if a same-resolution pair is refused\n"
+               "  %(prog)s --compare DIR_A DIR_B --h-rtol 2e-2\n"
+               "\n"
+               "  # erase the residual sub-tolerance h skew (shared-h units)\n"
+               "  %(prog)s --compare DIR_A DIR_B --renorm-h\n")
 
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--self-check", metavar="DIR",
@@ -849,11 +945,14 @@ def main():
     mode.add_argument("--compare", nargs="+", metavar="DIR",
                       help="STAGE 2-3 (active): per-dimension bottleneck/Wasserstein "
                            "between folds on --floor-axis (default unsigned-linear), "
-                           "gated by matching comparability_key AND matching h, with "
-                           "a per-pair selector-stability floor (each fold's Stage-1 "
-                           "floor computed once and cached) and a 'REAL iff any "
-                           "dimension clears its pair floor' verdict. Needs "
-                           "--write-grid output for every fold.")
+                           "gated by matching comparability_key AND h within "
+                           "--h-rtol (default 1e-2; admits export/orientation "
+                           "quantization but still rejects a true octree-level "
+                           "change), with a per-pair selector-stability floor (each "
+                           "fold's Stage-1 floor computed once and cached) and a "
+                           "'REAL iff any dimension clears its pair floor' verdict. "
+                           "Optionally renormalize all folds to a shared h with "
+                           "--renorm-h. Needs --write-grid output for every fold.")
     mode.add_argument("--floor", metavar="DIR",
                       help="STAGE 1 (active): compute the selector-stability noise "
                            "floor for one fold - dilate/erode the occupancy by +/-1 "
@@ -882,6 +981,22 @@ def main():
                          "(default unsigned-linear, the fold-vs-fold axis)")
     ap.add_argument("--floor-voxels", type=int, default=1,
                     help="perturbation size in voxels for --floor (default 1)")
+    ap.add_argument("--h-rtol", type=float, default=DEFAULT_H_RTOL,
+                    help="relative tolerance for the fold-vs-fold spacing (h) match "
+                         "(default %(default)g). Two same-resolution folds voxelized "
+                         "independently differ in h at the ~4th significant figure; "
+                         "this admits that quantization while a true octree-level "
+                         "change (~1.0 relative) is still rejected. Raise it if a "
+                         "same-nominal-resolution pair is refused; lower it to be "
+                         "stricter.")
+    ap.add_argument("--renorm-h", action="store_true",
+                    help="renormalize all --compare folds to a shared h (the mean of "
+                         "their spacings) before distances: each fold's diagram and "
+                         "floor are scaled by (h_ref/h_fold)**p, removing the "
+                         "sub-tolerance scale skew between independently-meshed folds. "
+                         "Off by default (the skew is ~1000x below the noise floor "
+                         "and cannot change a verdict); the fold-vs-itself null "
+                         "control stays exactly zero either way.")
     args = ap.parse_args()
 
     # ---- --info : pure loading, no gudhi ----
@@ -953,7 +1068,8 @@ def main():
         print("=" * 72)
         try:
             results = verdict(folds, axis=args.floor_axis, max_dim=args.max_dim,
-                              voxels=args.floor_voxels, verbose=True)
+                              voxels=args.floor_voxels, verbose=True,
+                              h_rtol=args.h_rtol, renorm_h=args.renorm_h)
         except RuntimeError as exc:
             sys.exit(f"[error] {exc}")
 
@@ -985,4 +1101,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
