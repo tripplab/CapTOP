@@ -54,7 +54,7 @@
 
 namespace captop {
 
-static const char* CAPTOP_VERSION = "0.1.0-stage7.2";
+static const char* CAPTOP_VERSION = "0.1.0-stage7.3";
 
 enum class GridMode {
     StrictCube,
@@ -2371,6 +2371,57 @@ static std::string sdt_convention_string(const SdtOptions& s){
     return sgn + ";" + sq;
 }
 
+// Stage 7.3: pick the single isotropic physical spacing h the SDT scales by, and
+// verify the grid is cubic to within a RELATIVE tolerance. The separable EDT works
+// in voxel-index units and multiplies by one scalar h (build_sdt_field), so the SDT
+// model is intrinsically isotropic; anisotropic voxels cannot be represented and
+// must instead be rejected.
+//
+// The earlier guard read vr.spacing (a single first-interval sample per axis) and
+// compared the three across axes with a 1e-9 relative tolerance. On OctreeMesh
+// exports the sorted-unique face coordinates are quantized to ~6-7 significant
+// figures, so consecutive intervals -- and therefore the first interval on each
+// axis -- routinely differ in the ~5th significant figure (e.g. 6.521500 vs
+// 6.521400, ~1.5e-5 relative). A 1e-9 check rejects such grids even though they are
+// cubic to well within any physically meaningful tolerance.
+//
+// Here we (a) take the per-axis spacing from the ROBUST median interval when axis
+// statistics are available (rectilinear / approximate-cube), falling back to the
+// exact vr.spacing in strict-cube mode where it is {h,h,h} by construction, and
+// (b) gate on the relative anisotropy (hmax-hmin)/hmax against aniso_tol (wired to
+// --cube-rel-tol). Returns the representative h = mean of the three axis spacings;
+// out_aniso receives the measured relative anisotropy so callers can record it in
+// the manifest rather than silently absorbing it.
+static double sdt_representative_spacing(const ValidationResult& vr, double aniso_tol, double& out_aniso){
+    double hx, hy, hz;
+    if(vr.axis_stats.available){
+        hx = vr.axis_stats.x.median_interval;
+        hy = vr.axis_stats.y.median_interval;
+        hz = vr.axis_stats.z.median_interval;
+    } else {
+        hx = vr.spacing.x; hy = vr.spacing.y; hz = vr.spacing.z;
+    }
+    if(!(hx>0.0) || !(hy>0.0) || !(hz>0.0)){
+        std::ostringstream oss;
+        oss<<std::setprecision(12)
+           <<"SDT requires a positive spacing on every axis; got ("<<hx<<", "<<hy<<", "<<hz<<")";
+        throw std::runtime_error(oss.str());
+    }
+    const double hmax = std::max(hx, std::max(hy, hz));
+    const double hmin = std::min(hx, std::min(hy, hz));
+    out_aniso = (hmax - hmin) / hmax;
+    if(out_aniso > aniso_tol){
+        std::ostringstream oss;
+        oss<<std::setprecision(12)
+           <<"SDT requires a near-cubic grid; per-axis spacing ("<<hx<<", "<<hy<<", "<<hz
+           <<") has relative anisotropy "<<out_aniso<<" exceeding --cube-rel-tol "<<aniso_tol
+           <<". Raise --cube-rel-tol if this is acceptable export quantization, "
+           <<"re-export with one element size, or use --grid strict-cube.";
+        throw std::runtime_error(oss.str());
+    }
+    return (hx + hy + hz) / 3.0;
+}
+
 static std::string json_escape(const std::string& v){
     std::ostringstream o; for(char c: v){ if(c=='"'||c=='\\') o<<'\\'<<c; else if(c=='\n') o<<"\\n"; else o<<c; } return o.str();
 }
@@ -2459,19 +2510,20 @@ static int run_convert(int argc,char** argv){
             if(copts.sdt.enabled) val=0.0; /* placeholder; overwritten by SDT field below */ else if(copts.filtration=="occupancy") val=0.0; else if(copts.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" has no material/layer id, but --filtration material requires material values for all occupied cells"); val=copts.has_selected_material ? (ic.material==copts.selected_material?0.0:std::numeric_limits<double>::infinity()) : static_cast<double>(ic.material); }
             else { auto it=scalars.find(ic.original_element_id); if(it==scalars.end()) throw std::runtime_error("missing scalar value for element "+std::to_string(ic.original_element_id)); val=(copts.filtration=="scalar-file")?it->second:(threshold_pass(it->second,copts.threshold,copts.threshold_op,vopts.tol)?0.0:std::numeric_limits<double>::infinity()); }
             g.cube_value=val; }
+        double sdt_h=0.0, sdt_aniso=0.0;
         if(copts.sdt.enabled){
-            // Stage 7: overwrite cube_value for EVERY cell in the bounding box with
-            // the signed distance transform value. SDT needs uniform spacing and
-            // both phases present (a pure-solid or pure-empty grid has no interface).
-            double hx=vr.spacing.x, hy=vr.spacing.y, hz=vr.spacing.z;
-            if(!(hx>0.0)) throw std::runtime_error("SDT requires positive uniform spacing");
-            if(std::abs(hx-hy)>1e-9*std::max(1.0,hx) || std::abs(hx-hz)>1e-9*std::max(1.0,hx))
-                throw std::runtime_error("SDT requires uniform (cubic) spacing; got ("+std::to_string(hx)+","+std::to_string(hy)+","+std::to_string(hz)+"). Re-export with one element size or use --grid strict-cube.");
+            // Stage 7 / 7.3: overwrite cube_value for EVERY cell in the bounding box
+            // with the signed distance transform value. The SDT scales voxel-index
+            // distances by a single isotropic spacing h derived from the robust
+            // per-axis median interval; the grid must be cubic to within
+            // --cube-rel-tol (see sdt_representative_spacing). Both phases must be
+            // present (a pure-solid or pure-empty grid has no interface).
+            sdt_h=sdt_representative_spacing(vr,vopts.cube_rel_tol,sdt_aniso);
             std::vector<uint8_t> occ_sdt(total,0); size_t n_occ=0;
             for(size_t i=0;i<total;++i){ occ_sdt[i]=cells[i].occupied?1:0; if(cells[i].occupied) n_occ++; }
             if(n_occ==0) throw std::runtime_error("SDT filtration requires at least one occupied cell");
             if(n_occ==total) throw std::runtime_error("SDT filtration requires at least one empty cell in the bounding box (grid is fully solid; no interface)");
-            std::vector<double> sdt=build_sdt_field(occ_sdt,vr.nx,vr.ny,vr.nz,hx,copts.sdt);
+            std::vector<double> sdt=build_sdt_field(occ_sdt,vr.nx,vr.ny,vr.nz,sdt_h,copts.sdt);
             for(size_t i=0;i<total;++i) cells[i].cube_value=sdt[i];
         }
         ConvertCounts cnt; std::vector<double> values(total); std::vector<uint8_t> occ(total); std::vector<int64_t> mat(total), eid(total);
@@ -2480,7 +2532,7 @@ static int run_convert(int argc,char** argv){
         std::filesystem::path outdir(copts.out_dir); std::filesystem::create_directories(outdir); if(!std::filesystem::is_directory(outdir)) throw std::runtime_error("output directory cannot be created");
         std::vector<std::string> names={"captop_grid_metadata.json","captop_cube_values_f64.raw","captop_occupied_u8.raw","captop_material_i64.raw","captop_element_id_i64.raw","captop_conversion_report.txt"}; for(auto& n:names) if(!copts.overwrite && std::filesystem::exists(outdir/n)) throw std::runtime_error("output file already exists: "+(outdir/n).string());
         write_raw(outdir/"captop_cube_values_f64.raw",values); write_raw(outdir/"captop_occupied_u8.raw",occ); write_raw(outdir/"captop_material_i64.raw",mat); write_raw(outdir/"captop_element_id_i64.raw",eid);
-        { std::ofstream js(outdir/"captop_grid_metadata.json"); js<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vopts.grid_mode)<<"\", \"tolerance\": "<<vopts.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_cells\": "<<total<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<", "<<vr.spacing.y<<", "<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\", \"axis_order\": [\"x\", \"y\", \"z\"]}"; if(vopts.grid_mode==GridMode::Rectilinear){ js<<",\n  \"axes\": {\"x\": "; write_axis_json(js,vr.x_axis); js<<", \"y\": "; write_axis_json(js,vr.y_axis); js<<", \"z\": "; write_axis_json(js,vr.z_axis); js<<"}";} js<<",\n  \"counts\": {\"nodes\": "<<vr.n_nodes<<", \"hexahedra\": "<<vr.n_hexes<<", \"occupied_cubes\": "<<cnt.occupied<<", \"missing_cubes\": "<<cnt.missing<<", \"finite_value_cubes\": "<<cnt.finite<<", \"selected_cubes\": "<<cnt.selected<<"},\n  \"filtration\": {\"policy\": \""<<copts.filtration<<"\", \"missing_value\": \"+inf\", \"scalar_file\": "; if(copts.scalar_file.empty()) js<<"null"; else js<<"\""<<json_escape(copts.scalar_file)<<"\""; js<<", \"threshold\": "; if(copts.has_threshold) js<<copts.threshold; else js<<"null"; js<<", \"threshold_op\": "; if(copts.filtration=="binary-threshold") js<<"\""<<copts.threshold_op<<"\""; else js<<"null"; js<<", \"selected_material\": "; if(copts.has_selected_material) js<<copts.selected_material; else js<<"null"; js<<", \"sdt\": "; if(copts.sdt.enabled){ js<<"{\"enabled\": true, \"signed\": "<<(copts.sdt.signed_?"true":"false")<<", \"square\": "<<(copts.sdt.square?"true":"false")<<", \"sign_convention\": \"negative_inside\", \"zero_level_is_occupied_set\": "<<(copts.sdt.signed_?"false":"true")<<", \"units\": \""<<(copts.sdt.square?"Angstrom^2":"Angstrom")<<"\", \"spacing_h\": "<<vr.spacing.x<<", \"convention\": \""<<sdt_convention_string(copts.sdt)<<"\"}"; } else js<<"null"; js<<"},\n  \"raw_files\": {\"cube_values_f64\": {\"path\": \"captop_cube_values_f64.raw\", \"type\": \"float64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"occupied_u8\": {\"path\": \"captop_occupied_u8.raw\", \"type\": \"uint8\", \"count\": "<<total<<"}, \"material_i64\": {\"path\": \"captop_material_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"element_id_i64\": {\"path\": \"captop_element_id_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}}\n}\n"; if(!js) throw std::runtime_error("cannot write metadata"); }
+        { std::ofstream js(outdir/"captop_grid_metadata.json"); js<<std::setprecision(17)<<"{\n  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n  \"validation\": {\"grid_mode\": \""<<grid_mode_name(vopts.grid_mode)<<"\", \"tolerance\": "<<vopts.tol<<", \"status\": \"VALID\"},\n  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz<<", \"total_cells\": "<<total<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"], \"spacing\": ["<<vr.spacing.x<<", "<<vr.spacing.y<<", "<<vr.spacing.z<<"], \"index_order\": \"i + nx * (j + ny * k)\", \"axis_order\": [\"x\", \"y\", \"z\"]}"; if(vopts.grid_mode==GridMode::Rectilinear){ js<<",\n  \"axes\": {\"x\": "; write_axis_json(js,vr.x_axis); js<<", \"y\": "; write_axis_json(js,vr.y_axis); js<<", \"z\": "; write_axis_json(js,vr.z_axis); js<<"}";} js<<",\n  \"counts\": {\"nodes\": "<<vr.n_nodes<<", \"hexahedra\": "<<vr.n_hexes<<", \"occupied_cubes\": "<<cnt.occupied<<", \"missing_cubes\": "<<cnt.missing<<", \"finite_value_cubes\": "<<cnt.finite<<", \"selected_cubes\": "<<cnt.selected<<"},\n  \"filtration\": {\"policy\": \""<<copts.filtration<<"\", \"missing_value\": \"+inf\", \"scalar_file\": "; if(copts.scalar_file.empty()) js<<"null"; else js<<"\""<<json_escape(copts.scalar_file)<<"\""; js<<", \"threshold\": "; if(copts.has_threshold) js<<copts.threshold; else js<<"null"; js<<", \"threshold_op\": "; if(copts.filtration=="binary-threshold") js<<"\""<<copts.threshold_op<<"\""; else js<<"null"; js<<", \"selected_material\": "; if(copts.has_selected_material) js<<copts.selected_material; else js<<"null"; js<<", \"sdt\": "; if(copts.sdt.enabled){ js<<"{\"enabled\": true, \"signed\": "<<(copts.sdt.signed_?"true":"false")<<", \"square\": "<<(copts.sdt.square?"true":"false")<<", \"sign_convention\": \"negative_inside\", \"zero_level_is_occupied_set\": "<<(copts.sdt.signed_?"false":"true")<<", \"units\": \""<<(copts.sdt.square?"Angstrom^2":"Angstrom")<<"\", \"spacing_h\": "<<sdt_h<<", \"anisotropy\": "<<sdt_aniso<<", \"convention\": \""<<sdt_convention_string(copts.sdt)<<"\"}"; } else js<<"null"; js<<"},\n  \"raw_files\": {\"cube_values_f64\": {\"path\": \"captop_cube_values_f64.raw\", \"type\": \"float64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"occupied_u8\": {\"path\": \"captop_occupied_u8.raw\", \"type\": \"uint8\", \"count\": "<<total<<"}, \"material_i64\": {\"path\": \"captop_material_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}, \"element_id_i64\": {\"path\": \"captop_element_id_i64.raw\", \"type\": \"int64\", \"endianness\": \"little\", \"count\": "<<total<<"}}\n}\n"; if(!js) throw std::runtime_error("cannot write metadata"); }
         std::string rep=conversion_report(input,copts.out_dir,vopts,copts,vr,cnt,bytes); { std::ofstream rr(outdir/"captop_conversion_report.txt"); rr<<rep; if(!rr) throw std::runtime_error("cannot write conversion report"); } std::cout<<rep; return 0;
     } catch(const ParseError& e){ std::cerr<<"parse error: "<<e.what()<<"\n"; return 1; } catch(const std::exception& e){ std::cerr<<"conversion error: "<<e.what()<<"\n"; return 3; }
 }
@@ -2519,8 +2571,9 @@ static int run_persist(int argc,char** argv){
 #endif
   std::string input=argv[2]; ParseOptions po; ValidateOptions vo; PersistOptions opt;
   for(int i=3;i<argc;++i){ std::string a=argv[i]; auto need=[&](const std::string& n){ if(i+1>=argc) throw std::runtime_error(n+" requires a value"); return std::string(argv[++i]);};
-    try{ if(a=="--grid"){ auto v=to_lower(need(a)); if(v=="strict"||v=="strict-cube") vo.grid_mode=GridMode::StrictCube; else if(v=="rectilinear") vo.grid_mode=GridMode::Rectilinear; else throw std::runtime_error("unsupported grid mode"); }
+    try{ if(a=="--grid"){ auto v=to_lower(need(a)); if(v=="strict"||v=="strict-cube") vo.grid_mode=GridMode::StrictCube; else if(v=="rectilinear") vo.grid_mode=GridMode::Rectilinear; else if(v=="approximate-cube") vo.grid_mode=GridMode::ApproximateCube; else throw std::runtime_error("unsupported grid mode"); }
       else if(a=="--tol"){ if(!parse_double(need(a),vo.tol)||vo.tol<=0) throw std::runtime_error("invalid --tol"); }
+      else if(a=="--cube-rel-tol"){ if(!parse_double(need(a),vo.cube_rel_tol)||vo.cube_rel_tol<0) throw std::runtime_error("invalid --cube-rel-tol"); }
       else if(a=="--ignore-non-hexa") po.ignore_non_hexa=true; else if(a=="--max-errors"){ long long n; if(!parse_long_long(need(a),n)||n<=0) throw std::runtime_error("invalid --max-errors"); vo.max_errors=n; }
       else if(a=="--homology-dim") opt.dims=parse_dims(need(a)); else if(a=="--field"){ long long f; if(!parse_long_long(need(a),f)||f>INT32_MAX) throw std::runtime_error("invalid --field"); opt.field=(int)f; }
       else if(a=="--filtration"){ opt.filtration=need(a); if(opt.filtration=="scalar-file" && i+1<argc && std::string(argv[i+1]).rfind("--",0)!=0) opt.scalar_file=argv[++i]; }
@@ -2541,17 +2594,18 @@ static int run_persist(int argc,char** argv){
     auto t0=std::chrono::steady_clock::now(); Mesh mesh=parse_mesh_file(input,po); ValidationResult vr=validate_mesh(mesh,vo); if(!vr.valid){ print_validation_report(input,vo,vr); return 2; }
     size_t total=(size_t)vr.nx*(size_t)vr.ny*(size_t)vr.nz; if(total*sizeof(double)>opt.max_memory_gb*1024.0*1024*1024&&!opt.force) throw std::runtime_error("dense grid memory estimate exceeds --max-memory-gb; use --force to override");
     std::vector<double> phys(total,std::numeric_limits<double>::infinity()), comp(total,std::numeric_limits<double>::infinity()); std::unordered_map<long long,double> scalars; if(opt.filtration=="scalar-file") scalars=read_scalar_file(opt.scalar_file);
+    double sdt_h=0.0, sdt_aniso=0.0;
     if(opt.sdt.enabled){
-      // Stage 7: signed distance transform over the whole bounding box.
-      double hx=vr.spacing.x, hy=vr.spacing.y, hz=vr.spacing.z;
-      if(!(hx>0.0)) throw std::runtime_error("SDT requires positive uniform spacing");
-      if(std::abs(hx-hy)>1e-9*std::max(1.0,hx) || std::abs(hx-hz)>1e-9*std::max(1.0,hx))
-        throw std::runtime_error("SDT requires uniform (cubic) spacing; got ("+std::to_string(hx)+","+std::to_string(hy)+","+std::to_string(hz)+"). Re-export with one element size or use --grid strict-cube.");
+      // Stage 7 / 7.3: signed distance transform over the whole bounding box.
+      // h is a single isotropic spacing derived from the robust per-axis median
+      // interval; the grid must be cubic to within --cube-rel-tol (see
+      // sdt_representative_spacing). sdt_h / sdt_aniso are recorded in the manifests.
+      sdt_h=sdt_representative_spacing(vr,vo.cube_rel_tol,sdt_aniso);
       std::vector<uint8_t> occ_sdt(total,0); size_t n_occ=0;
       for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); occ_sdt[idx]=1; n_occ++; }
       if(n_occ==0) throw std::runtime_error("SDT filtration requires at least one occupied cell");
       if(n_occ==total) throw std::runtime_error("SDT filtration requires at least one empty cell in the bounding box (grid is fully solid; no interface)");
-      std::vector<double> sdt=build_sdt_field(occ_sdt,vr.nx,vr.ny,vr.nz,hx,opt.sdt);
+      std::vector<double> sdt=build_sdt_field(occ_sdt,vr.nx,vr.ny,vr.nz,sdt_h,opt.sdt);
       for(size_t i=0;i<total;++i){ phys[i]=sdt[i]; comp[i]=sdt[i]; }   // mode forced sublevel for SDT
     } else
     for(const auto& ic: vr.indexed_cells){ size_t idx=linear_index(ic.i,ic.j,ic.k,vr.nx,vr.ny); double v=0; if(opt.filtration=="occupancy") v=0; else if(opt.filtration=="material"){ if(!ic.has_material) throw std::runtime_error("element "+std::to_string(ic.original_element_id)+" lacks material value"); v=(double)ic.material; } else { auto it=scalars.find(ic.original_element_id); if(it==scalars.end()) throw std::runtime_error("missing scalar value for element "+std::to_string(ic.original_element_id)); v=it->second; if(!std::isfinite(v)) throw std::runtime_error("scalar value for element "+std::to_string(ic.original_element_id)+" is nonfinite"); } phys[idx]=v; comp[idx]=(opt.mode=="superlevel")?-v:v; }
@@ -2644,7 +2698,7 @@ static int run_persist(int argc,char** argv){
             <<"], \"index_order\": \"i + nx * (j + ny * k)\", \"axis_order\": [\"x\", \"y\", \"z\"]},\n"
             <<"  \"filtration\": {\"policy\": \""<<opt.filtration<<"\", \"mode\": \""<<opt.mode<<"\"";
           if(opt.sdt.enabled) js<<", \"sdt\": {\"enabled\": true, \"signed\": "<<(opt.sdt.signed_?"true":"false")
-            <<", \"square\": "<<(opt.sdt.square?"true":"false")<<", \"sign_convention\": \"negative_inside\", \"convention\": \""<<sdt_convention_string(opt.sdt)<<"\"}";
+            <<", \"square\": "<<(opt.sdt.square?"true":"false")<<", \"sign_convention\": \"negative_inside\", \"spacing_h\": "<<sdt_h<<", \"anisotropy\": "<<sdt_aniso<<", \"convention\": \""<<sdt_convention_string(opt.sdt)<<"\"}";
           else js<<", \"sdt\": null";
           js<<"},\n  \"raw_files\": {\"occupied_u8\": {\"path\": \"captop_occupied_u8.raw\", \"type\": \"uint8\", \"count\": "<<total
             <<"}, \"cube_values_f64\": {\"path\": \"captop_cube_values_f64.raw\", \"type\": \"float64\", \"endianness\": \"little\", \"count\": "<<total
@@ -2672,14 +2726,19 @@ static int run_persist(int argc,char** argv){
       f<<"  \"software\": {\"name\": \"captop\", \"version\": \""<<CAPTOP_VERSION<<"\"},\n";
       f<<"  \"schema\": {\"format\": \"captop_diagram_manifest\", \"version\": 2, \"deaths_faithful\": true},\n";
       f<<"  \"input\": {\"path\": \""<<json_escape(input)<<"\"},\n";
+      // spacing_h is the scalar physical spacing GUDHI's field was scaled by. For SDT
+      // that is the representative isotropic h actually applied (mean of the robust
+      // per-axis medians), NOT vr.spacing.x (a single first-interval sample), so a
+      // Python consumer reconstructing the field reproduces it exactly.
       f<<"  \"grid\": {\"nx\": "<<vr.nx<<", \"ny\": "<<vr.ny<<", \"nz\": "<<vr.nz
-       <<", \"spacing_h\": "<<vr.spacing.x<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"]},\n";
+       <<", \"spacing_h\": "<<(opt.sdt.enabled?sdt_h:vr.spacing.x)<<", \"origin\": ["<<vr.origin.x<<", "<<vr.origin.y<<", "<<vr.origin.z<<"]},\n";
       f<<"  \"filtration\": {\"policy\": \""<<opt.filtration<<"\", \"mode\": \""<<opt.mode<<"\", \"units\": \""<<units<<"\", "
        <<"\"metric_axis\": \""<<metric_axis<<"\", \"min_persistence\": "<<opt.min_persistence
        <<", \"coefficient_field\": "<<opt.field<<", \"zero_threshold_meaningful\": "<<(zero_meaningful?"true":"false")<<", ";
       if(sdt_on) f<<"\"sdt\": {\"enabled\": true, \"signed\": "<<(opt.sdt.signed_?"true":"false")
                   <<", \"square\": "<<(opt.sdt.square?"true":"false")
-                  <<", \"sign_convention\": \"negative_inside\", \"convention\": \""<<sdt_convention_string(opt.sdt)<<"\"}";
+                  <<", \"sign_convention\": \"negative_inside\", \"spacing_h\": "<<sdt_h<<", \"anisotropy\": "<<sdt_aniso
+                  <<", \"convention\": \""<<sdt_convention_string(opt.sdt)<<"\"}";
       else f<<"\"sdt\": null";
       f<<"},\n";
       // Comparability key: two diagrams are bottleneck/Wasserstein-comparable iff
@@ -3723,3 +3782,5 @@ int main(int argc, char** argv) {
     captop::print_usage(std::cerr);
     return 1;
 }
+
+
