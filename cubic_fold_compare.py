@@ -924,13 +924,163 @@ def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True,
     return results
 
 
-def capsid_vs_mesh_table(alpha_diagram_dir, mesh_fold, max_dim=2):
-    """Stage 4 [NOT IMPLEMENTED]. The headline capsid-vs-mesh comparison as an
-    explicitly NON-metric structural table: top-feature multiplicity bands and the
-    H2-count-vs-h divergence, NOT a bottleneck distance (alpha and cubical do not
-    share a metric space and the counts are ~1/h^2 resolution-dependent)."""
-    raise NotImplementedError(
-        "Stage 4 (capsid_vs_mesh_table): structural (non-metric) comparison.")
+def _load_alpha_json(path):
+    """Load an alpha_fold_topology --emit-json file. Returns the parsed dict, with
+    the diagram converted to per-dim (N,2) finite arrays (inf deaths dropped for the
+    finite-bar comparisons; the raw Betti already counts essentials)."""
+    import json
+    doc = json.load(open(path))
+    if doc.get("schema", {}).get("format") != "alpha_topology":
+        raise ValueError(f"{path}: not an alpha_topology JSON "
+                         f"(schema.format={doc.get('schema', {}).get('format')})")
+    diag_raw = doc.get("diagram", {})
+    fin = {}
+    for d in range(4):
+        rows = diag_raw.get(f"H{d}", [])
+        pairs = [(float(b), float(dd)) for b, dd in rows
+                 if dd != "inf" and np.isfinite(float(dd))]
+        fin[d] = np.asarray(pairs, float).reshape(-1, 2) if pairs else np.empty((0, 2))
+    doc["_finite_diagram"] = fin
+    return doc
+
+
+def _top_bands(pairs, top_k=12, rel_tol=1e-3):
+    """Top-K longest-lived finite bars, collapsed into (persistence -> multiplicity)
+    bands with a relative tolerance. Returns a list of (persistence, multiplicity) in
+    descending-persistence order - the 'multiplicity pattern' for structural
+    comparison (the icosahedral ×3/×4 banding on the cubical side, the orbit
+    structure on the alpha side)."""
+    if len(pairs) == 0:
+        return []
+    lives = np.sort((pairs[:, 1] - pairs[:, 0]).astype(float))[::-1]
+    lives = lives[:max(top_k * 4, top_k)]
+    bands = []
+    i, n = 0, len(lives)
+    while i < n and len(bands) < top_k:
+        j = i + 1
+        while j < n and abs(lives[j] - lives[i]) <= rel_tol * max(1.0, abs(lives[i])):
+            j += 1
+        bands.append((round(float(np.mean(lives[i:j])), 3), j - i))
+        i = j
+    return bands
+
+
+def _cubical_betti0(fold):
+    """Cubical Betti-at-0 per dimension from a fold's manifest dimensions[]."""
+    out = {}
+    for dd in fold.manifest.get("dimensions", []):
+        out[dd["dim"]] = dd.get("betti_at_zero", 0)
+    return out
+
+
+def capsid_vs_mesh_table(alpha_json_path, mesh_folds, max_dim=2, top_k=12,
+                         verbose=True):
+    """Stage 4. The headline capsid-vs-mesh comparison, as an explicitly NON-METRIC
+    structural report. Compares the alpha-complex diagram of the ATOMS (from
+    alpha_fold_topology --emit-json) against the cubical diagram(s) of the MESH of
+    those atoms (CapTOP persist dirs). It NEVER computes a cross-representation
+    distance: the two live in incomparable spaces (alpha = r^2, off-grid, rotation-
+    invariant vs cubical SDT, grid-aliased, resolution-dependent), and the counts are
+    known not to match (alpha H2 ~ fixed 60; cubical H2 ~ 1/h^2 divergent). Instead
+    it reports three structural views:
+
+      C1  side-by-side Betti table (alpha raw + denoised vs cubical Betti-at-0),
+          h-tagged, with both selectors' metadata for alignment (report-and-trust);
+      C2  dominant-feature multiplicity bands from each representation, so the
+          icosahedral orbit structure can be compared qualitatively;
+      C3  the H2-count-vs-h divergence across the supplied mesh resolutions, shown
+          as the FINDING (voxelization resolves surface pockets the alpha complex
+          does not), against the fixed alpha H2.
+
+    alpha_json_path : path to one alpha_topology_{tag}.json
+    mesh_folds      : list of FoldData (one or more cubical persist dirs; multiple
+                      enables C3).
+
+    Returns a dict report (also printed when verbose)."""
+    alpha = _load_alpha_json(alpha_json_path)
+    a_raw = alpha.get("betti_at_0", {})
+    a_den = alpha.get("denoised_betti") or {}
+    a_sel = alpha.get("selector", {})
+    a_fin = alpha["_finite_diagram"]
+
+    meshes = sorted(mesh_folds,
+                    key=lambda f: (f.h if f.h is not None else 0.0), reverse=True)
+    report = {"alpha": {k: alpha[k] for k in alpha if not k.startswith("_")},
+              "meshes": []}
+
+    if verbose:
+        print("=" * 74)
+        print("CAPSID vs MESH  -  structural comparison (NON-METRIC by construction)")
+        print("=" * 74)
+        print(f"capsid={alpha.get('capsid')}  "
+              f"fold={alpha.get('fold', {}).get('label')}  "
+              f"alpha units={alpha.get('units')}")
+        print("\n[alignment]  alpha selector : "
+              + "  ".join(f"{k}={v}" for k, v in a_sel.items()
+                          if k in ("kind", "radius", "half_angle", "probe", "n_atoms")))
+        for f in meshes:
+            g = (f.grid_meta or {}).get("grid", {}) if f.grid_meta else {}
+            print(f"             mesh  '{f.label}' : h={f.h}  "
+                  f"grid={f.nx}x{f.ny}x{f.nz}  origin={g.get('origin')}  "
+                  f"units={f.units}")
+        print("  (regions are TRUSTED to match; verify the selector R and mesh "
+              "extent correspond)")
+
+        # C1
+        print("\n" + "-" * 74)
+        print("C1  Betti side-by-side  (alpha counts fixed; cubical counts h-dependent")
+        print("     -> NOT expected to be equal; shows what each representation sees)")
+        print("-" * 74)
+        header = f"  {'dim':<4} {'alpha raw':>10} {'alpha denoised':>15}"
+        for f in meshes:
+            header += f"  {('cub h=' + (f'{f.h:g}' if f.h else '?')):>12}"
+        print(header)
+        for d in range(max_dim + 1):
+            denv = (a_den.get(f"H{d}", "-") if a_den else "-")
+            row = f"  H{d:<3} {a_raw.get(f'H{d}', 0):>10} {str(denv):>15}"
+            for f in meshes:
+                row += f"  {_cubical_betti0(f).get(d, 0):>12}"
+            print(row)
+
+        # C2
+        print("\n" + "-" * 74)
+        print(f"C2  dominant-feature multiplicity (top {top_k} bands, persistence "
+              f"x multiplicity)")
+        print("     -> compare ORBIT STRUCTURE: alpha icosahedral orbits vs cubical "
+              "banding")
+        print("-" * 74)
+        for d in range(max_dim + 1):
+            print(f"  H{d}:")
+            ab = _top_bands(a_fin.get(d, np.empty((0, 2))), top_k)
+            print("    alpha (r^2)      : "
+                  + ("  ".join(f"{v:g}×{m}" for v, m in ab) if ab else "(none)"))
+            for f in meshes:
+                cb = _top_bands(f.diagrams.get(d, np.empty((0, 2))), top_k)
+                tag = f"cub h={f.h:g}" if f.h else "cub"
+                print(f"    {tag:<16} : "
+                      + ("  ".join(f"{v:g}×{m}" for v, m in cb) if cb else "(none)"))
+
+        # C3
+        print("\n" + "-" * 74)
+        print("C3  H2 count vs resolution  (FINDING: raw cubical H2 diverges ~1/h^2;")
+        print("     does NOT converge to the alpha cavity count)")
+        print("-" * 74)
+        a_h2_raw = a_raw.get("H2", 0)
+        a_h2_den = (a_den.get("H2") if a_den else None)
+        print(f"  alpha H2: raw={a_h2_raw}  denoised(robust)={a_h2_den}")
+        print(f"  {'mesh h (A)':>12} {'cubical H2@0':>14} {'cub/alpha_den':>14}")
+        for f in meshes:
+            h2 = _cubical_betti0(f).get(2, 0)
+            ratio = (f"{h2 / a_h2_den:.1f}x" if a_h2_den else "-")
+            print(f"  {(f'{f.h:g}' if f.h else '?'):>12} {h2:>14} {ratio:>14}")
+
+    for f in meshes:
+        report["meshes"].append({
+            "label": f.label, "h": f.h, "betti0": _cubical_betti0(f),
+            "top_bands": {f"H{d}": _top_bands(f.diagrams.get(d, np.empty((0, 2))), top_k)
+                          for d in range(max_dim + 1)},
+        })
+    return report
 
 
 # ===========================================================================
@@ -990,6 +1140,17 @@ def main():
                            "output. First asserts the Python SDT reproduces CapTOP's "
                            "stored field. This is the cubical analogue of "
                            "alpha_fold_compare control 2.")
+    mode.add_argument("--capsid-vs-mesh", nargs="+", metavar="ARG",
+                      help="STAGE 4 (active): NON-METRIC structural comparison of the "
+                           "alpha-complex diagram of the ATOMS against the cubical "
+                           "diagram(s) of the MESH. First ARG is an "
+                           "alpha_topology_{tag}.json (from alpha_fold_topology "
+                           "--emit-json); the rest are CapTOP persist dirs (one or "
+                           "more; several enables the H2-vs-h divergence view). "
+                           "Prints a side-by-side Betti table, dominant-feature "
+                           "multiplicity bands, and the H2-count-vs-h divergence - "
+                           "NOT a cross-representation distance (the two live in "
+                           "incomparable spaces).")
     mode.add_argument("--info", metavar="DIR",
                       help="load a fold and print what was found (manifest units, "
                            "comparability_key, h, per-dim bar counts, whether grid "
@@ -1088,6 +1249,20 @@ def main():
               "count as real fold signal (Stage 3 verdict; --metric selects which).")
         return
 
+    # ---- --capsid-vs-mesh : Stage 4 structural comparison (no gudhi needed) ----
+    if args.capsid_vs_mesh:
+        if len(args.capsid_vs_mesh) < 2:
+            sys.exit("[error] --capsid-vs-mesh needs an alpha JSON followed by at "
+                     "least one CapTOP persist dir")
+        alpha_json = args.capsid_vs_mesh[0]
+        mesh_dirs = args.capsid_vs_mesh[1:]
+        if not os.path.isfile(alpha_json):
+            sys.exit(f"[error] alpha JSON not found: {alpha_json}")
+        mesh_folds = [load_fold(d) for d in mesh_dirs]
+        capsid_vs_mesh_table(alpha_json, mesh_folds, max_dim=args.max_dim,
+                             verbose=True)
+        return
+
     # ---- --compare : Stage 2-3 (needs gudhi + scipy) ----
     if args.compare:
         if len(args.compare) < 2:
@@ -1140,4 +1315,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
