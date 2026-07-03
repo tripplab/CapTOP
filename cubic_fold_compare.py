@@ -629,7 +629,12 @@ def perturbation_floor(fold, max_dim=2, voxels=1, floor_axis="unsigned-linear",
 
     struct = ndimage.generate_binary_structure(3, 1)   # 6-connectivity (faces)
     per_direction = {}
+    # Two floors computed in the SAME pass (the perturbed diagrams are already in
+    # hand, so measuring Wasserstein-to-self alongside bottleneck-to-self is just an
+    # extra distance call, no extra persistence). 'floor' stays the bottleneck floor
+    # for backward compatibility; 'floor_wass' is the Wasserstein floor.
     floor = {d: 0.0 for d in range(max_dim + 1)}
+    floor_wass = {d: 0.0 for d in range(max_dim + 1)}
     for name, op in (("dilate", ndimage.binary_dilation),
                      ("erode", ndimage.binary_erosion)):
         occ_p = op(occ, structure=struct, iterations=voxels)
@@ -644,18 +649,25 @@ def perturbation_floor(fold, max_dim=2, voxels=1, floor_axis="unsigned-linear",
         field_p = captop_sdt(occ_p.reshape(-1), fold.nx, fold.ny, fold.nz,
                              h, signed, square)
         pert = field_to_diagrams(field_p, fold.nx, fold.ny, fold.nz, max_dim)
-        dists = {}
+        dists = {}; dists_w = {}
         for d in range(max_dim + 1):
-            bn = _bottleneck(base["diagrams"].get(d, np.empty((0, 2))),
-                             pert["diagrams"].get(d, np.empty((0, 2))))
+            A = base["diagrams"].get(d, np.empty((0, 2)))
+            B = pert["diagrams"].get(d, np.empty((0, 2)))
+            bn = _bottleneck(A, B)
+            wd = _wasserstein(A, B)
             dists[d] = bn
+            dists_w[d] = wd
             floor[d] = max(floor[d], bn)
-        per_direction[name] = dists
+            if not np.isnan(wd):
+                floor_wass[d] = max(floor_wass[d], wd)
+        per_direction[name] = {"bottleneck": dists, "wasserstein": dists_w}
         if verbose:
             cells = "  ".join(f"H{d}={dists[d]:.4g}" for d in range(max_dim + 1))
-            print(f"  {name} (+/-{voxels} vox): {cells}")
+            wcells = "  ".join(f"H{d}={dists_w[d]:.4g}" for d in range(max_dim + 1))
+            print(f"  {name} (+/-{voxels} vox): bn[{cells}]  w[{wcells}]")
 
-    return {"floor": floor, "per_direction": per_direction, "axis": floor_axis,
+    return {"floor": floor, "floor_wass": floor_wass,
+            "per_direction": per_direction, "axis": floor_axis,
             "voxels": voxels, "sdt_check": (sdt_ok, sdt_maxdiff)}
 
 
@@ -730,14 +742,16 @@ _wasserstein._warned = False
 def compute_fold_floor(fold, axis, max_dim=2, voxels=1, verbose=False, _cache={}):
     """Stage 1 floor for one fold on `axis`, COMPUTED ONCE and cached by
     (path, axis, voxels). Stage 3 combines per-fold floors per pair, so a fold that
-    appears in many pairs pays for its floor only once. Returns {d: bottleneck}."""
+    appears in many pairs pays for its floor only once. Returns a dict with both
+    metric floors: {'bottleneck': {d: ...}, 'wasserstein': {d: ...}}."""
     key = (os.path.abspath(fold.path), axis, voxels, max_dim)
     if key in _cache:
         return _cache[key]
     res = perturbation_floor(fold, max_dim=max_dim, voxels=voxels,
                              floor_axis=axis, verbose=verbose)
-    _cache[key] = res["floor"]
-    return res["floor"]
+    both = {"bottleneck": res["floor"], "wasserstein": res["floor_wass"]}
+    _cache[key] = both
+    return both
 
 
 def _renorm_power(axis):
@@ -834,24 +848,36 @@ def compare_folds(fold_a, fold_b, axis="unsigned-linear", max_dim=2,
 
 
 def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True,
-            h_rtol=DEFAULT_H_RTOL, renorm_h=False):
+            h_rtol=DEFAULT_H_RTOL, renorm_h=False, metric="bottleneck"):
     """Stage 3. For every pair of folds: per-dimension bottleneck/Wasserstein
     (Stage 2), a per-pair floor = max of the two folds' Stage-1 floors (each
     computed once and cached), and the verdict 'REAL fold difference' iff ANY
-    dimension's bottleneck clears its own pair floor (the permissive rule mirroring
+    dimension's distance clears its own pair floor (the permissive rule mirroring
     alpha_fold_compare). Per-dimension clears/noise is reported so the discriminating
-    dimension is visible (H2 is expected to carry it; H0 is typically floor 0).
+    dimension is visible.
+
+    metric selects which distance drives the verdict AND which floor it is gated
+    against - they MUST be the same metric (a Wasserstein distance cannot be gated
+    by a bottleneck floor):
+      'bottleneck'  (default): worst-single-point distance vs bottleneck floor.
+                    Conservative; on voxelized diagrams the single worst-matched
+                    point is noisy, so signals tend to sit near the floor.
+      'wasserstein': whole-diagram transport distance vs Wasserstein floor.
+                    Integrates the entire cavity/channel population, so it is more
+                    stable and (empirically) more discriminating for folds, at the
+                    cost of being sensitive to the swarm of small bars.
+    Both floors are computed in the same perturbation pass, so switching metric
+    costs nothing extra.
 
     h_rtol is the relative spacing-match tolerance (see _check_comparable). If
     renorm_h is True, all folds are renormalized to a single shared h_ref (the mean
     of the folds' h) before distances: each fold's diagram AND its floor are scaled
-    by (h_ref/h_fold)**p, keeping distance and floor in identical units. This removes
-    the sub-tolerance scale skew between independently-meshed folds; it is off by
-    default because that skew is ~1000x below the floor and cannot change a verdict.
-    The null control (fold vs itself, factor 1.0) stays exactly zero either way.
+    by (h_ref/h_fold)**p, keeping distance and floor in identical units.
 
     Returns a list of per-pair result dicts."""
     import itertools
+    if metric not in ("bottleneck", "wasserstein"):
+        raise ValueError(f"metric must be 'bottleneck' or 'wasserstein', got '{metric}'")
     # gate all pairs up front so we fail fast on any incompatibility
     labels = [f.label for f in folds]
     for a, b in itertools.combinations(folds, 2):
@@ -868,13 +894,15 @@ def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True,
             print(f"common-h renormalization ON: h_ref={h_ref:.6g} Angstrom "
                   f"(diagrams and floors scaled by (h_ref/h_fold)**p per axis)")
 
-    # per-fold floors, computed once each (cached), then scaled to h_ref units
+    # per-fold floors, computed once each (cached), then scaled to h_ref units.
+    # Select the floor for the chosen metric.
     if verbose:
-        print("per-fold selector-stability floors "
-              f"(axis={axis}, +/-{voxels} vox), computed once each:")
+        print(f"per-fold selector-stability floors (metric={metric}, "
+              f"axis={axis}, +/-{voxels} vox), computed once each:")
     floors = {}
     for f in folds:
-        raw = compute_fold_floor(f, axis, max_dim, voxels, verbose=False)
+        raw_both = compute_fold_floor(f, axis, max_dim, voxels, verbose=False)
+        raw = raw_both[metric]
         s = _renorm_factor(f.h, h_ref, axis)
         floors[f.label] = {d: raw[d] * s for d in range(max_dim + 1)}
         if verbose:
@@ -888,11 +916,11 @@ def verdict(folds, axis="unsigned-linear", max_dim=2, voxels=1, verbose=True,
                             h_rtol=h_rtol, h_ref=h_ref)
         pair_floor = {d: max(floors[a.label][d], floors[b.label][d])
                       for d in range(max_dim + 1)}
-        clears = {d: per[d]["bottleneck"] > pair_floor[d] for d in range(max_dim + 1)}
+        clears = {d: per[d][metric] > pair_floor[d] for d in range(max_dim + 1)}
         is_real = any(clears.values())
         results.append({"a": a.label, "b": b.label, "per": per,
                         "pair_floor": pair_floor, "clears": clears,
-                        "real": is_real, "axis": axis})
+                        "real": is_real, "axis": axis, "metric": metric})
     return results
 
 
@@ -997,9 +1025,15 @@ def main():
                          "Off by default (the skew is ~1000x below the noise floor "
                          "and cannot change a verdict); the fold-vs-itself null "
                          "control stays exactly zero either way.")
+    ap.add_argument("--metric", default="bottleneck",
+                    choices=["bottleneck", "wasserstein"],
+                    help="distance driving the --compare verdict, gated against the "
+                         "matching-metric floor (default bottleneck). 'bottleneck' is "
+                         "the conservative worst-single-point distance; 'wasserstein' "
+                         "integrates the whole diagram and is empirically more "
+                         "discriminating for folds. Both floors are computed in one "
+                         "pass, so switching is free.")
     args = ap.parse_args()
-
-    # ---- --info : pure loading, no gudhi ----
     if args.info:
         fd = load_fold(args.info)
         print(f"fold '{fd.label}'  ({fd.path})")
@@ -1044,12 +1078,14 @@ def main():
               f"units={fd.units}, h={fd.h})")
         res = perturbation_floor(fd, max_dim=args.max_dim, voxels=args.floor_voxels,
                                  floor_axis=args.floor_axis, verbose=True)
-        floor = res["floor"]
+        floor = res["floor"]; floor_w = res["floor_wass"]
         print("\n  selector-stability floor per dim (worst over dilate/erode):")
-        print("    " + "   ".join(f"H{d}={floor[d]:.4g}"
-                                  for d in range(args.max_dim + 1)))
-        print("\n  a cross-fold bottleneck must EXCEED this to count as real fold "
-              "signal (Stage 3 verdict).")
+        print("    bottleneck : " + "   ".join(f"H{d}={floor[d]:.4g}"
+                                                for d in range(args.max_dim + 1)))
+        print("    wasserstein: " + "   ".join(f"H{d}={floor_w[d]:.4g}"
+                                                for d in range(args.max_dim + 1)))
+        print("\n  a cross-fold distance must EXCEED the matching-metric floor to "
+              "count as real fold signal (Stage 3 verdict; --metric selects which).")
         return
 
     # ---- --compare : Stage 2-3 (needs gudhi + scipy) ----
@@ -1064,12 +1100,13 @@ def main():
                          f"CapTOP persist with --write-grid (needed for the "
                          f"axis-consistent recompute and the floor).")
         print(f"comparing {len(folds)} folds on axis={args.floor_axis}, "
-              f"floor +/-{args.floor_voxels} vox")
+              f"floor +/-{args.floor_voxels} vox, metric={args.metric}")
         print("=" * 72)
         try:
             results = verdict(folds, axis=args.floor_axis, max_dim=args.max_dim,
                               voxels=args.floor_voxels, verbose=True,
-                              h_rtol=args.h_rtol, renorm_h=args.renorm_h)
+                              h_rtol=args.h_rtol, renorm_h=args.renorm_h,
+                              metric=args.metric)
         except RuntimeError as exc:
             sys.exit(f"[error] {exc}")
 
@@ -1084,15 +1121,17 @@ def main():
                 for d in range(args.max_dim + 1))
             print(f"  {r['a']} vs {r['b']}\n    {cells}")
 
+        mlabel = args.metric
         print("\n" + "=" * 72)
-        print("verdict (REAL iff ANY dimension's bottleneck clears its pair floor)")
+        print(f"verdict (metric={mlabel}: REAL iff ANY dimension's {mlabel} "
+              f"clears its pair floor)")
         print("=" * 72)
         for r in results:
             tag = ("REAL fold difference" if r["real"]
                    else "within noise floor (not significant)")
             print(f"  {r['a']} vs {r['b']}  ->  {tag}")
             print("      " + "   ".join(
-                f"H{d}: {r['per'][d]['bottleneck']:.4g} vs "
+                f"H{d}: {r['per'][d][mlabel]:.4g} vs "
                 f"floor {r['pair_floor'][d]:.4g} "
                 f"{'CLEARS' if r['clears'][d] else 'noise'}"
                 for d in range(args.max_dim + 1)))
@@ -1101,4 +1140,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+    
